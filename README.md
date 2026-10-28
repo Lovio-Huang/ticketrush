@@ -1,6 +1,6 @@
 # TicketRush
 
-[![CI](https://github.com/Bastardki11er/ticketrush/actions/workflows/ci.yml/badge.svg)](https://github.com/Bastardki11er/ticketrush/actions/workflows/ci.yml)
+[![CI](https://github.com/Lovio-Huang/ticketrush/actions/workflows/ci.yml/badge.svg)](https://github.com/Lovio-Huang/ticketrush/actions/workflows/ci.yml)
 ![Java 21](https://img.shields.io/badge/Java-21-orange)
 ![Spring Boot 4](https://img.shields.io/badge/Spring%20Boot-4.1-brightgreen)
 
