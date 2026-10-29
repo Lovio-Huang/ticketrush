@@ -9,16 +9,14 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 
-/**
- * {@code X-User-Id} stands in for an authenticated principal; in production it
- * would come from a validated JWT set by the API gateway.
- */
 @RestController
 public class ReservationController {
 
@@ -35,11 +33,11 @@ public class ReservationController {
 	}
 
 	@PostMapping("/api/events/{eventId}/reservations")
-	public ResponseEntity<ReservationResponse> reserve(@PathVariable long eventId,
-			@RequestHeader("X-User-Id") @NotBlank @Size(max = 64) String userId,
+	public ResponseEntity<ReservationResponse> reserve(@PathVariable long eventId, @AuthenticationPrincipal Jwt jwt,
 			@RequestHeader("Idempotency-Key") @NotBlank @Size(max = 64) String idempotencyKey,
 			@Valid @RequestBody ReservationRequest request) {
-		ReservationService.Result result = reservations.reserve(eventId, userId, request.quantity(), idempotencyKey);
+		ReservationService.Result result = reservations.reserve(eventId, jwt.getSubject(), request.quantity(),
+				idempotencyKey);
 		String statusUrl = "/api/orders/" + result.orderId();
 		return ResponseEntity.accepted()
 			.location(URI.create(statusUrl))

@@ -1,11 +1,16 @@
 package com.yitaihuang.ticketrush.event;
 
 import java.time.Clock;
+import java.util.List;
+import java.util.Map;
 
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.yitaihuang.ticketrush.common.AfterCommit;
+import com.yitaihuang.ticketrush.common.PageResponse;
 import com.yitaihuang.ticketrush.reservation.StockGateway;
 
 @Service
@@ -42,6 +47,17 @@ public class EventService {
 		int available = stock.available(eventId)
 			.orElseGet(() -> events.findById(eventId).map(Event::getAvailableTickets).orElse(0));
 		return EventResponse.of(snapshot, available);
+	}
+
+	/** Upcoming events with live availability, read from Redis in a single round trip. */
+	@Transactional(readOnly = true)
+	public PageResponse<EventResponse> upcoming(Pageable pageable) {
+		Page<Event> page = events.findByStartsAtAfterOrderBySaleStartsAtAsc(clock.instant(), pageable);
+		List<Long> ids = page.getContent().stream().map(Event::getId).toList();
+		Map<Long, Integer> live = stock.availableMany(ids);
+		return PageResponse.of(page,
+				event -> EventResponse.of(EventSnapshot.of(event), live.getOrDefault(event.getId(),
+						event.getAvailableTickets())));
 	}
 
 }

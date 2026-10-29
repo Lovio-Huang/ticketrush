@@ -39,17 +39,18 @@ class ReservationApiIntegrationTest extends AbstractIntegrationTest {
 		String orderId = orderId(reserved);
 
 		await().atMost(Duration.ofSeconds(15))
-			.untilAsserted(() -> assertThat(mvc.get().uri("/api/orders/{id}", orderId).header("X-User-Id", "alice"))
+			.untilAsserted(() -> assertThat(
+					mvc.get().uri("/api/orders/{id}", orderId).header("Authorization", bearer("alice")))
 				.bodyJson()
 				.extractingPath("$.status")
 				.isEqualTo("PENDING_PAYMENT"));
 
-		assertThat(mvc.post().uri("/api/orders/{id}/payment", orderId).header("X-User-Id", "alice"))
+		assertThat(mvc.post().uri("/api/orders/{id}/payment", orderId).header("Authorization", bearer("alice")))
 			.hasStatusOk()
 			.bodyJson()
 			.extractingPath("$.status")
 			.isEqualTo("PAID");
-		assertThat(mvc.post().uri("/api/orders/{id}/payment", orderId).header("X-User-Id", "alice"))
+		assertThat(mvc.post().uri("/api/orders/{id}/payment", orderId).header("Authorization", bearer("alice")))
 			.hasStatus(HttpStatus.CONFLICT)
 			.bodyJson()
 			.extractingPath("$.code")
@@ -75,7 +76,7 @@ class ReservationApiIntegrationTest extends AbstractIntegrationTest {
 		String orderId = orderId(reserve(eventId, "carol", "mine", 1));
 		await().atMost(Duration.ofSeconds(15)).until(() -> orders.existsById(orderId));
 
-		assertThat(mvc.get().uri("/api/orders/{id}", orderId).header("X-User-Id", "mallory"))
+		assertThat(mvc.get().uri("/api/orders/{id}", orderId).header("Authorization", bearer("mallory")))
 			.hasStatus(HttpStatus.NOT_FOUND);
 	}
 
@@ -86,7 +87,11 @@ class ReservationApiIntegrationTest extends AbstractIntegrationTest {
 				{"name":"Later","venue":"Arena","startsAt":"%s","saleStartsAt":"%s",
 				 "totalTickets":10,"priceCents":100,"perUserLimit":2}
 				""".formatted(now.plus(30, ChronoUnit.DAYS), now.plus(1, ChronoUnit.DAYS));
-		MvcTestResult created = mvc.post().uri("/api/events").contentType(MediaType.APPLICATION_JSON).content(body)
+		MvcTestResult created = mvc.post()
+			.uri("/api/events")
+			.header("Authorization", adminBearer())
+			.contentType(MediaType.APPLICATION_JSON)
+			.content(body)
 			.exchange();
 		assertThat(created).hasStatus(HttpStatus.CREATED);
 		long eventId = json.readTree(created.getResponse().getContentAsByteArray()).get("id").asLong();
@@ -117,7 +122,7 @@ class ReservationApiIntegrationTest extends AbstractIntegrationTest {
 		assertThat(reserve(eventId, "erin", "bad-qty", 0)).hasStatus(HttpStatus.BAD_REQUEST);
 		assertThat(mvc.post()
 			.uri("/api/events/{id}/reservations", eventId)
-			.header("X-User-Id", "erin")
+			.header("Authorization", bearer("erin"))
 			.contentType(MediaType.APPLICATION_JSON)
 			.content("{\"quantity\":1}")).hasStatus(HttpStatus.BAD_REQUEST);
 		assertThat(reserve(999_999, "erin", "no-event", 1)).hasStatus(HttpStatus.NOT_FOUND)
@@ -129,7 +134,7 @@ class ReservationApiIntegrationTest extends AbstractIntegrationTest {
 	private MvcTestResult reserve(long eventId, String userId, String idempotencyKey, int quantity) {
 		return mvc.post()
 			.uri("/api/events/{id}/reservations", eventId)
-			.header("X-User-Id", userId)
+			.header("Authorization", bearer(userId))
 			.header("Idempotency-Key", idempotencyKey)
 			.contentType(MediaType.APPLICATION_JSON)
 			.content("{\"quantity\":" + quantity + "}")

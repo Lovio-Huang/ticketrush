@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TicketRush Console</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">⚡</span>
+      <span>TicketRush</span>
+      <span class="tag">demo console</span>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-view="events" role="tab">Events</button>
+      <button class="tab" data-view="orders" role="tab">My orders</button>
+      <button class="tab admin-only" data-view="admin" role="tab" hidden>Admin</button>
+    </nav>
+    <div id="session" class="session"></div>
+  </header>
+
+  <main>
+    <!-- Events + reservation -->
+    <section id="view-events" class="view">
+      <div class="layout">
+        <div>
+          <div class="section-head">
+            <h2>Upcoming events</h2>
+            <span class="muted live"><span class="dot"></span>live availability</span>
+          </div>
+          <div id="event-list" class="event-list"></div>
+        </div>
+        <aside id="reserve-panel" class="panel">
+          <p class="muted">Pick an event to reserve tickets.</p>
+        </aside>
+      </div>
+    </section>
+
+    <!-- Order history -->
+    <section id="view-orders" class="view" hidden>
+      <div class="section-head">
+        <h2>My orders</h2>
+        <select id="order-filter" aria-label="Filter by status">
+          <option value="">All statuses</option>
+          <option>PENDING_PAYMENT</option>
+          <option>PAID</option>
+          <option>EXPIRED</option>
+          <option>CANCELLED</option>
+          <option>REJECTED</option>
+        </select>
+      </div>
+      <div id="order-table"></div>
+    </section>
+
+    <!-- Admin -->
+    <section id="view-admin" class="view" hidden>
+      <div class="layout">
+        <form id="create-event" class="panel">
+          <h2>Create event</h2>
+          <label>Name <input name="name" required maxlength="200" value="Midnight Arena Tour"></label>
+          <label>Venue <input name="venue" required maxlength="200" value="SAP Center, San Jose"></label>
+          <div class="row">
+            <label>Tickets <input name="totalTickets" type="number" min="1" value="500" required></label>
+            <label>Price ($) <input name="price" type="number" min="0" step="0.01" value="89.00" required></label>
+            <label>Per user <input name="perUserLimit" type="number" min="1" max="10" value="2" required></label>
+          </div>
+          <div class="row">
+            <label>Sale opens <input name="saleStartsAt" type="datetime-local" required></label>
+            <label>Event starts <input name="startsAt" type="datetime-local" required></label>
+          </div>
+          <button class="primary" type="submit">Create event</button>
+        </form>
+        <div class="panel">
+          <div class="section-head">
+            <h2>Sales dashboard</h2>
+            <select id="stats-event" aria-label="Event"></select>
+          </div>
+          <div id="stats"></div>
+          <p class="muted small">Refreshes every second. Run <code>scripts/load_test.py</code> and watch the counters move.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a href="/swagger-ui.html" target="_blank" rel="noopener">API docs (Swagger)</a>
+    <a href="/actuator/prometheus" target="_blank" rel="noopener">Prometheus metrics</a>
+    <a href="https://github.com/Bastardki11er/ticketrush" target="_blank" rel="noopener">Source on GitHub</a>
+  </footer>
+
+  <dialog id="auth-dialog">
+    <form id="auth-form" method="dialog">
+      <h2 id="auth-title">Log in</h2>
+      <label>Username <input name="username" autocomplete="username" required minlength="3" maxlength="32"></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required minlength="8" maxlength="72"></label>
+      <p id="auth-error" class="error" hidden></p>
+      <div class="row end">
+        <button type="button" id="auth-switch" class="link"></button>
+        <button type="button" id="auth-cancel">Cancel</button>
+        <button class="primary" type="submit" id="auth-submit">Log in</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toasts" aria-live="polite"></div>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>
