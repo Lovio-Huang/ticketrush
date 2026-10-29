@@ -2,16 +2,23 @@ package com.yitaihuang.ticketrush.order;
 
 import java.time.Instant;
 
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+
 import com.fasterxml.jackson.annotation.JsonInclude;
 
+import org.springframework.data.domain.PageRequest;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.yitaihuang.ticketrush.common.ApiException;
+import com.yitaihuang.ticketrush.common.PageResponse;
 
 @RestController
 @RequestMapping("/api/orders")
@@ -41,8 +48,18 @@ public class OrderController {
 
 	}
 
+	/** The caller's orders, newest first, optionally filtered by status. */
+	@GetMapping
+	public PageResponse<OrderResponse> mine(@AuthenticationPrincipal Jwt jwt,
+			@RequestParam(required = false) OrderStatus status, @RequestParam(defaultValue = "0") @Min(0) int page,
+			@RequestParam(defaultValue = "20") @Min(1) @Max(100) int size) {
+		return PageResponse.of(orders.history(jwt.getSubject(), status, PageRequest.of(page, size)),
+				OrderResponse::of);
+	}
+
 	@GetMapping("/{orderId}")
-	public OrderResponse get(@PathVariable String orderId, @RequestHeader("X-User-Id") String userId) {
+	public OrderResponse get(@PathVariable String orderId, @AuthenticationPrincipal Jwt jwt) {
+		String userId = jwt.getSubject();
 		return orders.find(orderId, userId).map(OrderResponse::of).orElseGet(() -> {
 			if (pendingOrders.isProcessingFor(orderId, userId)) {
 				return OrderResponse.processing(orderId);
@@ -52,13 +69,13 @@ public class OrderController {
 	}
 
 	@PostMapping("/{orderId}/payment")
-	public OrderResponse pay(@PathVariable String orderId, @RequestHeader("X-User-Id") String userId) {
-		return OrderResponse.of(orders.pay(orderId, userId));
+	public OrderResponse pay(@PathVariable String orderId, @AuthenticationPrincipal Jwt jwt) {
+		return OrderResponse.of(orders.pay(orderId, jwt.getSubject()));
 	}
 
 	@PostMapping("/{orderId}/cancellation")
-	public OrderResponse cancel(@PathVariable String orderId, @RequestHeader("X-User-Id") String userId) {
-		return OrderResponse.of(orders.cancel(orderId, userId));
+	public OrderResponse cancel(@PathVariable String orderId, @AuthenticationPrincipal Jwt jwt) {
+		return OrderResponse.of(orders.cancel(orderId, jwt.getSubject()));
 	}
 
 }

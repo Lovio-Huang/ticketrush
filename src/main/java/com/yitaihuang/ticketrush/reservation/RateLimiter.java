@@ -32,8 +32,16 @@ public class RateLimiter {
 	}
 
 	public boolean tryAcquire(String userId) {
-		Long allowed = redis.execute(TOKEN_BUCKET, List.of("ticketrush:ratelimit:" + userId), capacity,
-				refillPerSecond);
+		return tryAcquire(userId, capacity, refillPerSecond);
+	}
+
+	/** A bucket of its own size: at most {@code perMinute} requests in a burst, refilled evenly over a minute. */
+	public boolean tryAcquirePerMinute(String key, int perMinute) {
+		return tryAcquire(key, String.valueOf(perMinute), String.valueOf(perMinute / 60.0));
+	}
+
+	private boolean tryAcquire(String key, String bucketCapacity, String refill) {
+		Long allowed = redis.execute(TOKEN_BUCKET, List.of("ticketrush:ratelimit:" + key), bucketCapacity, refill);
 		return allowed != null && allowed == 1L;
 	}
 

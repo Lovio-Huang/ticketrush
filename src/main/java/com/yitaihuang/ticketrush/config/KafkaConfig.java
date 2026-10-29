@@ -4,7 +4,9 @@ import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.TopicPartition;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.config.TopicBuilder;
+import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
@@ -37,6 +39,20 @@ public class KafkaConfig {
 		var handler = new DefaultErrorHandler(recoverer, new FixedBackOff(500L, 3));
 		handler.addNotRetryableExceptions(JacksonException.class);
 		return handler;
+	}
+
+	/**
+	 * For the dead-letter listener: retries forever instead of dead-lettering the
+	 * dead letters. A failure record must not be lost, and the listener only
+	 * fails when MySQL is unavailable.
+	 */
+	@Bean
+	ConcurrentKafkaListenerContainerFactory<String, String> deadLetterContainerFactory(
+			ConsumerFactory<String, String> consumerFactory) {
+		var factory = new ConcurrentKafkaListenerContainerFactory<String, String>();
+		factory.setConsumerFactory(consumerFactory);
+		factory.setCommonErrorHandler(new DefaultErrorHandler(new FixedBackOff(2000L, FixedBackOff.UNLIMITED_ATTEMPTS)));
+		return factory;
 	}
 
 	static String deadLetterTopic(String topic) {

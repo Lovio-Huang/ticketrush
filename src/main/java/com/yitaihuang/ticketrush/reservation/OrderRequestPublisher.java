@@ -1,64 +1,86 @@
 package com.yitaihuang.ticketrush.reservation;
 
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
 import org.springframework.stereotype.Component;
 
 import com.yitaihuang.ticketrush.config.TicketrushProperties;
-import com.yitaihuang.ticketrush.order.OrderRequested;
-
-import tools.jackson.databind.json.JsonMapper;
 
 /**
- * Hands an accepted reservation to Kafka. The send is synchronous: we only tell
- * the client "accepted" after the broker has durably stored the message
- * (acks=all), trading a few milliseconds of latency for never losing an order.
+ * Hands an accepted reservation to Kafka and reports what is actually known
+ * about the outcome. The send is synchronous: normally the client hears
+ * "accepted" only after the broker has stored the message (acks=all).
  */
 @Component
 public class OrderRequestPublisher {
 
-	private final KafkaTemplate<String, String> kafka;
+	private static final Logger log = LoggerFactory.getLogger(OrderRequestPublisher.class);
 
-	private final JsonMapper json;
+	public enum Delivery {
+
+		/** The broker acknowledged the message. */
+		ACKED,
+
+		/** The producer failed before queueing the record, so it was never sent. */
+		NOT_SENT,
+
+		/** It may or may not be stored: an ack that timed out or failed after the send. */
+		UNKNOWN
+
+	}
+
+	private final KafkaTemplate<String, String> kafka;
 
 	private final String topic;
 
 	private final Duration timeout;
 
-	public OrderRequestPublisher(KafkaTemplate<String, String> kafka, JsonMapper json,
-			TicketrushProperties properties) {
+	public OrderRequestPublisher(KafkaTemplate<String, String> kafka, TicketrushProperties properties) {
 		this.kafka = kafka;
-		this.json = json;
 		this.topic = properties.orders().topic();
 		this.timeout = properties.reservations().publishTimeout();
 	}
 
-	public void publish(OrderRequested request) {
-		// Keyed by event id: all orders for one event land on the same partition,
-		// so they are written in order by a single consumer with no row contention.
-		String key = String.valueOf(request.eventId());
+	/**
+	 * Keyed by event id: all orders for one event land on the same partition, so
+	 * they are written in order by a single consumer with no row contention.
+	 */
+	public Delivery publish(long eventId, String orderId, String orderJson) {
+		CompletableFuture<SendResult<String, String>> ack;
 		try {
-			kafka.send(topic, key, json.writeValueAsString(request)).get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+			// KafkaTemplate throws here only if the producer failed before queueing the
+			// record (no metadata within max.block.ms, serialization, producer closed).
+			ack = kafka.send(topic, String.valueOf(eventId), orderJson);
+		}
+		catch (RuntimeException ex) {
+			log.warn("Order {} was not sent to Kafka: {}", orderId, ex.toString());
+			return Delivery.NOT_SENT;
+		}
+		try {
+			ack.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+			return Delivery.ACKED;
 		}
 		catch (InterruptedException ex) {
 			Thread.currentThread().interrupt();
-			throw new OrderPublishException(request.orderId(), ex);
+			return unknown(orderId, ex);
 		}
 		catch (ExecutionException | TimeoutException ex) {
-			throw new OrderPublishException(request.orderId(), ex);
+			// The record left the producer; the broker may have stored it even if the ack never came back.
+			return unknown(orderId, ex);
 		}
 	}
 
-	public static class OrderPublishException extends RuntimeException {
-
-		OrderPublishException(String orderId, Throwable cause) {
-			super("Kafka did not acknowledge order " + orderId, cause);
-		}
-
+	private static Delivery unknown(String orderId, Exception ex) {
+		log.warn("Kafka did not confirm order {}; the outbox relay will retry: {}", orderId, ex.toString());
+		return Delivery.UNKNOWN;
 	}
 
 }
