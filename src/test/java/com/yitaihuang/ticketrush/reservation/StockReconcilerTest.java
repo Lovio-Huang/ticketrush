@@ -89,7 +89,17 @@ class StockReconcilerTest {
 	}
 
 	@Test
+	void withoutDriftTheExpensiveRecountIsSkipped() {
+		when(stock.drifted(1L, 10)).thenReturn(false);
+
+		reconciler.reconcile(event);
+
+		verify(stock, never()).recount(anyLong(), org.mockito.ArgumentMatchers.anyInt());
+	}
+
+	@Test
 	void stockIsRecountedFromHeldOrdersNotCopiedFromMysql() {
+		when(stock.drifted(1L, 10)).thenReturn(true);
 		when(stock.recount(1L, 10)).thenReturn(new Recount(5, 7, false));
 
 		reconciler.reconcile(event);
@@ -101,6 +111,7 @@ class StockReconcilerTest {
 
 	@Test
 	void aRecountThatChangesNothingIsNotCounted() {
+		when(stock.drifted(1L, 10)).thenReturn(true);
 		reconciler.reconcile(event);
 
 		assertThat(meters.counter("ticketrush.stock.corrections").count()).isZero();

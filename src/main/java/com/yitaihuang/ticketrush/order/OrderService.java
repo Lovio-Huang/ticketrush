@@ -18,7 +18,10 @@ import com.yitaihuang.ticketrush.common.ApiException;
 import com.yitaihuang.ticketrush.config.TicketrushProperties;
 import com.yitaihuang.ticketrush.event.EventRepository;
 import com.yitaihuang.ticketrush.reservation.StockGateway;
+import com.yitaihuang.ticketrush.reservation.StockGateway.Claim;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import tools.jackson.databind.json.JsonMapper;
 
 @Service
@@ -38,14 +41,28 @@ public class OrderService {
 
 	private final Clock clock;
 
+	private final Timer claims;
+
 	public OrderService(OrderRepository orders, EventRepository events, StockGateway stock,
-			TicketrushProperties properties, JsonMapper json, Clock clock) {
+			TicketrushProperties properties, JsonMapper json, MeterRegistry meters, Clock clock) {
 		this.orders = orders;
 		this.events = events;
 		this.stock = stock;
 		this.properties = properties;
 		this.json = json;
 		this.clock = clock;
+		this.claims = Timer.builder("ticketrush.orders.claim").publishPercentiles(0.5, 0.95, 0.99).register(meters);
+	}
+
+	/**
+	 * Persists a batch of orders in one transaction, one commit: each goes through
+	 * the same steps as {@link #recordRequest} (claim in Redis first, idempotent
+	 * by order id; a repeat within the batch finds the first copy). If anything
+	 * fails, the whole batch rolls back and the caller retries it order by order.
+	 */
+	@Transactional
+	public void recordRequests(List<OrderRequested> requests) {
+		requests.forEach(this::recordRequest);
 	}
 
 	/**
@@ -61,6 +78,15 @@ public class OrderService {
 			syncRedis(requireSameRequest(existing.get(), request), request);
 			return;
 		}
+		// Claim the order in Redis before giving it tickets in MySQL. The claim is
+		// atomic with releases: if Redis already released it (its request decided it
+		// was never sent), or was rebuilt after a loss without it (its send came after
+		// the rebuild's barrier), it is recorded as rejected and takes no stock.
+		if (claim(request, true) == Claim.RELEASED) {
+			log.warn("Rejecting order {}: Redis released it or was rebuilt without it", request.orderId());
+			orders.save(Order.rejected(request, clock.instant()));
+			return;
+		}
 		Instant now = clock.instant();
 		Order order;
 		if (events.decrementAvailable(request.eventId(), request.quantity()) == 0) {
@@ -72,7 +98,16 @@ public class OrderService {
 		else {
 			order = orders.save(Order.pendingPayment(request, now, properties.orders().paymentWindow()));
 		}
-		syncRedis(order, request);
+		if (order.getStatus() == OrderStatus.REJECTED) {
+			AfterCommit.run(() -> stock.release(order.getEventId(), order.getId()));
+		}
+	}
+
+	private Claim claim(OrderRequested request, boolean firstDelivery) {
+		Duration idempotencyLeft = Duration.between(clock.instant(),
+				request.requestedAt().plus(properties.reservations().idempotencyTtl()));
+		return claims.record(() -> stock.confirm(request.eventId(), request.orderId(), request.userId(),
+				request.idempotencyKey(), json.writeValueAsString(request), idempotencyLeft, firstDelivery));
 	}
 
 	/**
@@ -95,22 +130,21 @@ public class OrderService {
 	}
 
 	/**
-	 * Brings Redis in line with the order once MySQL has committed: an active
-	 * order is confirmed (leaves the outbox, re-held if Redis lost it), any other
-	 * gives its tickets back. Both are idempotent, and a failure here fails the
-	 * message, so Kafka's redelivery retries it.
+	 * Brings Redis in line with an order MySQL already has (a redelivery): an
+	 * active order is claimed (leaves the outbox, re-held if Redis lost it), any
+	 * other gives its tickets back. Both are idempotent, and a failure here fails
+	 * the message, so Kafka's redelivery retries it.
 	 */
 	private void syncRedis(Order order, OrderRequested request) {
-		long eventId = order.getEventId();
 		if (order.getStatus().holdsTickets()) {
-			String orderJson = json.writeValueAsString(request);
-			Duration idempotencyLeft = Duration.between(clock.instant(),
-					request.requestedAt().plus(properties.reservations().idempotencyTtl()));
-			AfterCommit.run(() -> stock.confirm(eventId, order.getId(), order.getUserId(), order.getIdempotencyKey(),
-					orderJson, idempotencyLeft));
+			AfterCommit.run(() -> {
+				if (claim(request, false) == Claim.RELEASED) {
+					log.error("Order {} is active in MySQL but released in Redis", order.getId());
+				}
+			});
 		}
 		else {
-			AfterCommit.run(() -> stock.release(eventId, order.getId()));
+			AfterCommit.run(() -> stock.release(order.getEventId(), order.getId()));
 		}
 	}
 

@@ -68,6 +68,12 @@ public class ReservationService {
 			throw rejected("rate_limited", ApiException.tooManyRequests("RATE_LIMITED", "Too many requests, slow down"));
 		}
 
+		if (!recovery.redisTrusted()) {
+			// Default deny: this instance hasn't confirmed yet that Redis's state isn't an old copy.
+			throw rejected("stock_recovering", ApiException.serviceUnavailable("STOCK_RECOVERING",
+					"Ticket inventory is being restored, retry shortly"));
+		}
+
 		EventSnapshot event = catalog.get(eventId);
 		Instant now = clock.instant();
 		if (now.isBefore(event.saleStartsAt())) {
@@ -109,10 +115,15 @@ public class ReservationService {
 		switch (publisher.publish(eventId, orderId, orderJson)) {
 			case ACKED -> stock.markPublished(eventId, orderId);
 			case NOT_SENT -> {
-				// Kafka never got it, so nobody will persist it: give the tickets back.
-				stock.releaseAndForget(eventId, orderId, userId, idempotencyKey);
-				throw rejected("queue_unavailable",
-						ApiException.serviceUnavailable("ORDER_QUEUE_UNAVAILABLE", "Could not place the order, retry"));
+				// Our send never left the producer. Unless the relay or the consumer has
+				// taken the order meanwhile (then a copy may be in Kafka, and the release
+				// is refused), nobody will persist it: give the tickets back.
+				if (stock.releaseAndForget(eventId, orderId, userId, idempotencyKey)) {
+					throw rejected("queue_unavailable", ApiException.serviceUnavailable("ORDER_QUEUE_UNAVAILABLE",
+							"Could not place the order, retry"));
+				}
+				count("unconfirmed");
+				log.warn("Order {} was not sent by this request but was already taken by the relay", orderId);
 			}
 			case UNKNOWN -> {
 				// Kafka may already have it. Releasing now could sell these tickets twice;

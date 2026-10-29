@@ -10,6 +10,7 @@
 -- KEYS[3] idempotency key    ticketrush:{event:<id>}:idem:<userId>:<key>
 -- KEYS[4] orders hash        ticketrush:{event:<id>}:orders   (orderId -> order JSON while held, 'R' once released)
 -- KEYS[5] outbox             ticketrush:{event:<id>}:outbox   (orderId scored by accept time, until Kafka confirms)
+-- KEYS[6] held counter       ticketrush:{event:<id>}:held     (tickets of held orders; stock + held = total)
 -- ARGV[1] userId
 -- ARGV[2] quantity
 -- ARGV[3] per-user limit
@@ -49,6 +50,7 @@ if held + qty > tonumber(ARGV[3]) then
 end
 
 redis.call('DECRBY', KEYS[1], qty)
+redis.call('INCRBY', KEYS[6], qty)
 redis.call('HINCRBY', KEYS[2], ARGV[1], qty)
 redis.call('SET', KEYS[3], ARGV[4], 'EX', tonumber(ARGV[5]))
 redis.call('HSET', KEYS[4], ARGV[4], ARGV[6])

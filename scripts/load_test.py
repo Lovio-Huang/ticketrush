@@ -163,23 +163,30 @@ class VisibilitySampler:
             time.sleep(self.POLL_S)
 
 
-def queue_lag(base):
-    """Current consumer lag from the app's Prometheus endpoint, or None."""
+def queue_metrics(base):
+    """Consumer lag and messages the consumer has written so far, from the app's
+    Prometheus endpoint; None for what it couldn't read."""
     conn = http.client.HTTPConnection(base.hostname, base.port or 80, timeout=10)
+    lag = writes = None
     try:
         conn.request("GET", "/actuator/prometheus")
         for line in conn.getresponse().read().decode().splitlines():
             if line.startswith("ticketrush_orders_queue_lag"):
-                return float(line.rsplit(" ", 1)[1])
+                lag = float(line.rsplit(" ", 1)[1])
+            elif line.startswith("ticketrush_orders_consumed_total"):
+                writes = float(line.rsplit(" ", 1)[1])
+            elif writes is None and line.startswith("ticketrush_orders_write_seconds_count"):
+                # Before the batch consumer, one write was one message.
+                writes = float(line.rsplit(" ", 1)[1])
     except (OSError, http.client.HTTPException):
-        return None
+        pass
     finally:
         conn.close()
-    return None
+    return lag, writes
 
 
 class LagWatcher(threading.Thread):
-    """Samples the Kafka backlog every 200 ms in the background."""
+    """Samples the Kafka backlog and the consumer's write count every 200 ms in the background."""
 
     def __init__(self, base):
         super().__init__(daemon=True)
@@ -187,9 +194,9 @@ class LagWatcher(threading.Thread):
 
     def run(self):
         while self.running:
-            lag = queue_lag(self.base)
+            lag, writes = queue_metrics(self.base)
             if lag is not None and lag >= 0:
-                self.samples.append((time.perf_counter(), lag))
+                self.samples.append((time.perf_counter(), lag, writes))
             time.sleep(0.2)
 
 
@@ -247,8 +254,14 @@ def main():
     burst_s = burst_end - started
     ok_ms = [ms for outcome, ms, *_ in results if outcome == "accepted"]
     other_ms = [ms for outcome, ms, *_ in results if outcome != "accepted"]
-    peak_lag = max((lag for _, lag in watcher.samples), default=float("nan"))
-    lag_zero = next((t for t, lag in watcher.samples if t >= burst_end and lag == 0), None)
+    peak_lag = max((lag for _, lag, _ in watcher.samples), default=float("nan"))
+    lag_zero = next((t for t, lag, _ in watcher.samples if t >= burst_end and lag == 0), None)
+    # The consumer's own rate while it had a backlog: writes between the first sample
+    # with lag and the first one back at 0. Not limited by how fast requests arrived.
+    backlog = [(t, w) for t, lag, w in watcher.samples if w is not None and lag > 0]
+    end = next(((t, w) for t, lag, w in watcher.samples if w is not None and t >= burst_end and lag == 0), None)
+    consumer_rate = ((end[1] - backlog[0][1]) / (end[0] - backlog[0][0])
+                     if backlog and end and end[0] > backlog[0][0] else None)
 
     print(f"\nHTTP burst    {len(results)} requests in {burst_s:.2f}s  ->  {len(results) / burst_s:,.0f} req/s"
           f"  ({accepted / burst_s:,.0f} accepted/s)")
@@ -260,7 +273,8 @@ def main():
           f" drained {all_persisted - burst_end:.2f}s after the last response")
     print(f"202->visible  (ms, {len(sampler.delays_ms)} sampled)  {summary(sampler.delays_ms)}")
     print(f"Kafka backlog peak {peak_lag:,.0f} messages; lag back to 0 "
-          + (f"{lag_zero - burst_end:.2f}s after the last response" if lag_zero else "not observed"))
+          + (f"{lag_zero - burst_end:.2f}s after the last response" if lag_zero else "not observed")
+          + (f"; consumer wrote {consumer_rate:,.0f} msgs/s while backlogged" if consumer_rate else ""))
 
     left = stats["availableInDatabase"]
     print(f"\nLeft on sale  MySQL {left}, Redis {stats['availableInRedis']}, in sync: {stats['storesInSync']}")
@@ -273,9 +287,13 @@ def main():
             "req_per_s": round(len(results) / burst_s), "accepted_per_s": round(accepted / burst_s),
             "orders_per_s_end_to_end": round(persisted / (all_persisted - started)),
             "drain_s": round(all_persisted - burst_end, 2), "peak_lag": peak_lag,
+            "lag_zero_s": round(lag_zero - burst_end, 2) if lag_zero else None,
+            "consumer_per_s": round(consumer_rate) if consumer_rate else None,
             "ok_p50": statistics.median(ok_ms) if ok_ms else None,
+            "ok_p95": percentile(ok_ms, 95) if ok_ms else None,
             "ok_p99": percentile(ok_ms, 99) if ok_ms else None,
             "visible_p50": statistics.median(sampler.delays_ms) if sampler.delays_ms else None,
+            "visible_p95": percentile(sampler.delays_ms, 95) if sampler.delays_ms else None,
             "visible_p99": percentile(sampler.delays_ms, 99) if sampler.delays_ms else None,
             "outcomes": outcomes, "pass": ok,
         }))

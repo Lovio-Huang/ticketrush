@@ -32,10 +32,20 @@ import io.micrometer.core.instrument.MeterRegistry;
  *
  * Each run, per event on sale: a missing stock key triggers a rebuild; orders
  * Redis still holds but MySQL has finished (cancelled, expired, rejected, e.g.
- * after a crash right after the commit) are released; then stock and per-user
- * counts are recounted from the held orders in one atomic script. Every step is
- * either idempotent per order or atomic, so it runs safely during a sale, with
- * the consumer paused, and on several instances at once.
+ * after a crash right after the commit) are released; then, if the O(1)
+ * stock-count invariant check {@code stock + held = total} fails, stock and
+ * per-user counts are recounted from the held orders in one atomic script. That
+ * check covers the two counters only, not the orders hash, per-user counts or
+ * agreement with MySQL: it is not an audit. Every step is either idempotent
+ * per order or atomic, so it runs safely during a sale, with the consumer
+ * paused, and on several instances at once.
+ *
+ * <p>The full recount is gated because it blocks Redis for its whole run
+ * (measured: ~3 ms per 2k held orders, ~34 ms per 20k, ~220 ms per 100k). The
+ * held-order scan above uses HSCAN, which doesn't block, and only proposes
+ * candidates: every release it triggers is idempotent and only for orders
+ * MySQL has finished, so an order added or released mid-scan is at worst
+ * picked up on the next run.
  */
 @Component
 public class StockReconciler {
@@ -81,6 +91,9 @@ public class StockReconciler {
 			return;
 		}
 		releaseFinishedOrders(eventId);
+		if (!stock.drifted(eventId, event.getTotalTickets())) {
+			return;
+		}
 		Recount recount = stock.recount(eventId, event.getTotalTickets());
 		if (recount.changed()) {
 			meters.counter("ticketrush.stock.corrections").increment();

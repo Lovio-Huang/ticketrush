@@ -14,15 +14,14 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.kafka.listener.MessageListenerContainer;
 
 import com.yitaihuang.ticketrush.AbstractIntegrationTest;
 import com.yitaihuang.ticketrush.common.ApiException;
 import com.yitaihuang.ticketrush.config.TicketrushProperties;
 import com.yitaihuang.ticketrush.event.EventCatalog;
 import com.yitaihuang.ticketrush.order.OrderConsumer;
+import com.yitaihuang.ticketrush.order.OrderFailureService;
 import com.yitaihuang.ticketrush.order.OrderRequested;
 import com.yitaihuang.ticketrush.order.OrderService;
 import com.yitaihuang.ticketrush.order.OrderStatus;
@@ -50,9 +49,9 @@ class ConsistencyIntegrationTest extends AbstractIntegrationTest {
 
 	@Autowired OrderConsumer consumer;
 
-	@Autowired OrderQueueLag lag;
+	@Autowired OrderFailureService failures;
 
-	@Autowired KafkaListenerEndpointRegistry listeners;
+	@Autowired OrderQueueLag lag;
 
 	@Autowired KafkaTemplate<String, String> kafka;
 
@@ -232,6 +231,16 @@ class ConsistencyIntegrationTest extends AbstractIntegrationTest {
 		assertThatThrownBy(() -> consumer.onOrderRequested(orphan))
 			.isInstanceOf(DataIntegrityViolationException.class);
 		assertThat(orders.findByEventId(eventId)).hasSize(1);
+
+		// Redis never reserved the clash, so its claim refused it: it took no tickets. It is
+		// dead-lettered all the same (its rejected row clashes too); voiding it changes no stock.
+		assertThat(stock.available(eventId)).hasValue(9);
+		failures.record(clash, "DataIntegrityViolationException", "test-clash@1");
+		failures.voidOrder(failures.list(null).stream()
+			.filter(f -> clash.equals(f.getPayload()))
+			.findFirst()
+			.orElseThrow()
+			.getId(), null);
 		assertStoresAgree(eventId);
 	}
 
@@ -302,7 +311,8 @@ class ConsistencyIntegrationTest extends AbstractIntegrationTest {
 			carolsOrder[0] = reservations.reserve(eventId, carol, 1, "carol-1").orderId(); // still in Kafka
 			await().atMost(Duration.ofSeconds(15)).until(() -> lag.current().orElse(0) > 0);
 
-			redis.delete(redis.keys("ticketrush:{event:" + eventId + "}:*")); // Redis restarted empty
+			wipeRedis(eventId); // Redis restarted empty
+			quietPeriodOver(eventId); // sends from before the loss are done; only the queue is left
 
 			// Carol's order is in neither store yet: rebuilding now would forget it, so intake waits.
 			assertThatThrownBy(() -> reservations.reserve(eventId, dave, 1, "dave-1"))
@@ -336,16 +346,6 @@ class ConsistencyIntegrationTest extends AbstractIntegrationTest {
 	private ReservationService serviceWith(OrderRequestPublisher publisher) {
 		return new ReservationService(catalog, stock, recovery, rateLimiter, publisher, pendingOrders, json, meters,
 				Clock.systemUTC());
-	}
-
-	private void withConsumerStopped(Runnable body) {
-		listeners.getListenerContainers().forEach(MessageListenerContainer::stop);
-		try {
-			body.run();
-		}
-		finally {
-			listeners.getListenerContainers().forEach(MessageListenerContainer::start);
-		}
 	}
 
 }
