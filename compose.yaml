@@ -36,9 +36,11 @@ services:
 
   redis:
     image: redis:7.4-alpine
-    # AOF, fsync every second: a restart loses at most ~1 s of writes instead of
-    # everything. Never evict: losing an order's key would break the stock invariant.
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    # No persistence: a restart comes back empty, which the app treats as a full loss
+    # and rebuilds from MySQL. A restart from an AOF/RDB file would bring back an older
+    # state the app can't tell from the real one until its restart check notices
+    # (RedisRestartGuard). Never evict: losing one key would break the stock invariant.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:

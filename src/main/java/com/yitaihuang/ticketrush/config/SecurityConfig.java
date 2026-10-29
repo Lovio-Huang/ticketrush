@@ -76,7 +76,7 @@ public class SecurityConfig {
 			.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
 			.authorizeHttpRequests(auth -> auth
 				.requestMatchers("/api/auth/register", "/api/auth/login").permitAll()
-				.requestMatchers("/api/events/*/stats").hasAuthority("SCOPE_admin")
+				.requestMatchers("/api/events/*/stats", "/api/admin/**").hasAuthority("SCOPE_admin")
 				.requestMatchers(HttpMethod.POST, "/api/events").hasAuthority("SCOPE_admin")
 				.requestMatchers(HttpMethod.GET, "/api/events", "/api/events/*").permitAll()
 				.requestMatchers("/actuator/health/**", "/actuator/info", "/actuator/prometheus").permitAll()

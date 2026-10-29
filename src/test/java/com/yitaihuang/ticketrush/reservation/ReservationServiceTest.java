@@ -62,7 +62,17 @@ class ReservationServiceTest {
 				new JsonMapper(), meters, Clock.fixed(NOW, ZoneOffset.UTC));
 		when(publisher.publish(anyLong(), anyString(), anyString())).thenReturn(Delivery.ACKED);
 		when(rateLimiter.tryAcquire(anyString())).thenReturn(true);
+		when(recovery.redisTrusted()).thenReturn(true);
 		when(catalog.get(1L)).thenReturn(EVENT);
+	}
+
+	@Test
+	void untilRedisIsTrustedReservationsAreRefusedWithoutTouchingIt() {
+		when(recovery.redisTrusted()).thenReturn(false);
+
+		assertThatThrownBy(() -> service.reserve(1L, "alice", 1, "key-1"))
+			.hasFieldOrPropertyWithValue("code", "STOCK_RECOVERING");
+		verifyNoInteractions(stock, publisher);
 	}
 
 	@Test
@@ -110,11 +120,25 @@ class ReservationServiceTest {
 	void ticketsAreReturnedWhenTheOrderDefinitelyWasNotSent() {
 		givenRedisAnswers(Outcome.RESERVED);
 		when(publisher.publish(anyLong(), anyString(), anyString())).thenReturn(Delivery.NOT_SENT);
+		when(stock.releaseAndForget(anyLong(), anyString(), anyString(), anyString())).thenReturn(true);
 
 		assertThatThrownBy(() -> service.reserve(1L, "alice", 2, "key-1")).isInstanceOf(ApiException.class)
 			.hasFieldOrPropertyWithValue("status", HttpStatus.SERVICE_UNAVAILABLE);
 		verify(stock).releaseAndForget(eq(1L), anyString(), eq("alice"), eq("key-1"));
 		verify(pendingOrders, never()).markProcessing(anyString(), anyString());
+	}
+
+	@Test
+	void aNotSentOrderTheRelayAlreadyTookIsAcceptedNotReleased() {
+		givenRedisAnswers(Outcome.RESERVED);
+		when(publisher.publish(anyLong(), anyString(), anyString())).thenReturn(Delivery.NOT_SENT);
+		when(stock.releaseAndForget(anyLong(), anyString(), anyString(), anyString())).thenReturn(false);
+
+		ReservationService.Result result = service.reserve(1L, "alice", 2, "key-1");
+
+		assertThat(result.replayed()).isFalse();
+		verify(pendingOrders).markProcessing(result.orderId(), "alice");
+		assertThat(meters.counter("ticketrush.reservations", "outcome", "unconfirmed").count()).isEqualTo(1);
 	}
 
 	@Test

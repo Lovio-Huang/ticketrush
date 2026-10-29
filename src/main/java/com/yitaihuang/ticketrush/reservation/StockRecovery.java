@@ -5,7 +5,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,10 +32,27 @@ import tools.jackson.databind.json.JsonMapper;
  * second order.
  *
  * <p>While the event's stock key is missing, reservations for it are refused
- * (503, retryable). The rebuild waits until the order topic is drained, because
- * an order still in Kafka is in neither store: rebuilding before it lands would
- * forget its idempotency key. Orders consumed during the rebuild are confirmed
- * into the same hash, so none is lost either way.
+ * (503, retryable). The barrier before rebuilding has two parts:
+ * <ol>
+ * <li>a quiet period from the moment the loss was first noticed, longer than a
+ * send can stay in flight (max.block.ms + delivery.timeout.ms), so requests and
+ * relay batches that started before the loss, on any instance, have either
+ * reached Kafka or failed for good;</li>
+ * <li>then consumer lag 0, so everything that did reach Kafka is in MySQL.</li>
+ * </ol>
+ * After that MySQL knows every order whose send had reached the producer, but
+ * not one whose request paused before its send for longer than any timer. Such
+ * an order arrives after the rebuild, unknown to Redis while the stock key
+ * exists, and the consumer rejects it (see confirm.lua); that is sound because
+ * {@link RedisRestartGuard} turns every restart into a full loss, so Redis never
+ * runs on a partial old state. Orders only Redis knew are gone with Redis, and a
+ * retry with their idempotency key places a fresh order.
+ *
+ * <p>The rebuild runs under a lease identified by a random token, checked inside
+ * every seeding script and the final recount, so a rebuilder that stalled past
+ * its lease (or whose Redis was wiped again) can't write into a newer rebuild.
+ * A crashed rebuild leaves its lease to expire; the next one re-seeds, which is
+ * idempotent. Orders consumed meanwhile are claimed into the same hash.
  */
 @Component
 public class StockRecovery {
@@ -59,59 +78,95 @@ public class StockRecovery {
 
 	private final Duration idempotencyTtl;
 
+	private final Duration quietPeriod;
+
 	private final MeterRegistry meters;
 
 	private final Clock clock;
 
+	private final RedisRestartGuard guard;
+
 	public StockRecovery(EventRepository events, OrderRepository orders, StockGateway stock, OrderQueueLag queueLag,
-			JsonMapper json, TicketrushProperties properties, MeterRegistry meters, Clock clock) {
+			JsonMapper json, TicketrushProperties properties, MeterRegistry meters, Clock clock,
+			RedisRestartGuard guard) {
+		this.guard = guard;
 		this.events = events;
 		this.orders = orders;
 		this.stock = stock;
 		this.queueLag = queueLag;
 		this.json = json;
 		this.idempotencyTtl = properties.reservations().idempotencyTtl();
+		this.quietPeriod = properties.reservations().recoveryQuietPeriod();
 		this.meters = meters;
 		this.clock = clock;
 	}
 
-	/** Returns true once the event's Redis state exists again, false if it isn't safe to rebuild yet. */
+	/** False until this instance has confirmed that the Redis server's state can be trusted (see RedisRestartGuard). */
+	public boolean redisTrusted() {
+		return guard.verified();
+	}
+
+	/** Returns true once the event's Redis state exists again, false if it isn't safe (or this caller's turn) yet. */
 	public boolean rebuild(long eventId) {
-		if (!stock.tryLeaseRebuild(eventId, LEASE)) {
-			return false;
+		if (!guard.verified()) {
+			return false; // the Redis server isn't trusted (yet): a wipe may still be coming
+		}
+		String token = UUID.randomUUID().toString();
+		switch (stock.beginRebuild(eventId, token, LEASE, quietPeriod)) {
+			case DONE:
+				return true;
+			case BUSY:
+			case WAIT:
+				return false;
+			case GO:
+				break;
 		}
 		OptionalLong lag = queueLag.current();
 		if (lag.isEmpty() || lag.getAsLong() > 0) {
-			stock.shortenRebuildLease(eventId, RETRY_AFTER);
+			stock.releaseRebuildLease(eventId, token, RETRY_AFTER);
 			return false;
 		}
 		try {
-			if (stock.available(eventId).isPresent()) {
-				return true;
-			}
-			Event event = events.findById(eventId).orElseThrow();
-			Instant now = clock.instant();
-			List<SeedOrder> batch = new ArrayList<>(BATCH);
-			int seeded = 0;
-			for (Order order : orders.findByEventId(eventId)) {
-				batch.add(seedOf(order, now));
-				if (batch.size() == BATCH) {
-					stock.seed(eventId, batch);
-					seeded += batch.size();
-					batch.clear();
+			return seedAndFinish(eventId, token);
+		}
+		catch (RuntimeException ex) {
+			stock.releaseRebuildLease(eventId, token, Duration.ZERO);
+			throw ex;
+		}
+	}
+
+	private boolean seedAndFinish(long eventId, String token) {
+		Event event = events.findById(eventId).orElseThrow();
+		Instant now = clock.instant();
+		List<SeedOrder> batch = new ArrayList<>(BATCH);
+		int seeded = 0;
+		for (Order order : orders.findByEventId(eventId)) {
+			batch.add(seedOf(order, now));
+			if (batch.size() == BATCH) {
+				if (!stock.seed(eventId, token, LEASE, batch)) {
+					return fencedOff(eventId);
 				}
+				seeded += batch.size();
+				batch.clear();
 			}
-			stock.seed(eventId, batch);
-			seeded += batch.size();
-			Recount recount = stock.recount(eventId, event.getTotalTickets());
-			meters.counter("ticketrush.stock.rebuilds").increment();
-			log.warn("Rebuilt Redis state of event {} from {} MySQL orders: stock {}", eventId, seeded,
-					recount.stock());
-			return true;
 		}
-		finally {
-			stock.endRebuild(eventId);
+		if (!stock.seed(eventId, token, LEASE, batch)) {
+			return fencedOff(eventId);
 		}
+		seeded += batch.size();
+		Optional<Recount> recount = stock.finishRebuild(eventId, token, event.getTotalTickets());
+		if (recount.isEmpty()) {
+			return fencedOff(eventId);
+		}
+		meters.counter("ticketrush.stock.rebuilds").increment();
+		log.warn("Rebuilt Redis state of event {} from {} MySQL orders: stock {}", eventId, seeded,
+				recount.get().stock());
+		return true;
+	}
+
+	private boolean fencedOff(long eventId) {
+		log.warn("Rebuild of event {} lost its lease; leaving it to the current holder", eventId);
+		return false;
 	}
 
 	private SeedOrder seedOf(Order order, Instant now) {

@@ -6,6 +6,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -20,6 +21,8 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
+import org.springframework.kafka.listener.MessageListenerContainer;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import com.yitaihuang.ticketrush.auth.Role;
@@ -30,6 +33,7 @@ import com.yitaihuang.ticketrush.event.EventService;
 import com.yitaihuang.ticketrush.order.Order;
 import com.yitaihuang.ticketrush.order.OrderRepository;
 import com.yitaihuang.ticketrush.order.OrderRequested;
+import com.yitaihuang.ticketrush.order.OrderStatus;
 import com.yitaihuang.ticketrush.reservation.ReservationService;
 
 import tools.jackson.databind.json.JsonMapper;
@@ -42,7 +46,11 @@ import tools.jackson.databind.json.JsonMapper;
 // Background jobs off: tests that need them call them directly, at a known moment.
 // The relay resends anything unconfirmed when a test calls it, without waiting.
 @SpringBootTest(properties = { "ticketrush.orders.expiry-scan-interval=PT1H", "ticketrush.reconciliation.interval=PT1H",
-		"ticketrush.reservations.relay-interval=PT1H", "ticketrush.reservations.republish-after=PT0S" })
+		"ticketrush.reservations.relay-interval=PT1H", "ticketrush.reservations.republish-after=PT0S",
+		// Recovery waits until a test says the quiet period is over (quietPeriodOver).
+		"ticketrush.reservations.recovery-quiet-period=PT1H",
+		// The Redis restart check runs once at startup; tests that need it call it.
+		"ticketrush.reservations.redis-check-interval=PT1H" })
 @AutoConfigureMockMvc
 @Import(TestcontainersConfiguration.class)
 @Testcontainers(disabledWithoutDocker = true)
@@ -68,6 +76,9 @@ public abstract class AbstractIntegrationTest {
 
 	@Autowired
 	protected JsonMapper json;
+
+	@Autowired
+	private KafkaListenerEndpointRegistry listeners;
 
 	/** Test users by name, each with a stable numeric id: the JWT subject the API sees. */
 	private static final Map<String, Long> USER_IDS = new ConcurrentHashMap<>();
@@ -101,6 +112,28 @@ public abstract class AbstractIntegrationTest {
 		String orderId = reservations.reserve(eventId, userId, quantity, UUID.randomUUID().toString()).orderId();
 		await().atMost(Duration.ofSeconds(15)).until(() -> orders.existsById(orderId));
 		return orderId;
+	}
+
+	/** Runs {@code body} with the order writer stopped, so accepted orders pile up in Kafka. */
+	protected void withConsumerStopped(Runnable body) {
+		MessageListenerContainer writer = listeners.getListenerContainer("order-writer");
+		writer.stop();
+		try {
+			body.run();
+		}
+		finally {
+			writer.start();
+		}
+	}
+
+	/** Redis lost everything it had about the event, as after a restart without persistence. */
+	protected void wipeRedis(long eventId) {
+		redis.delete(redis.keys("ticketrush:{event:" + eventId + "}:*"));
+	}
+
+	/** Pretends the loss was noticed long ago, so the recovery quiet period has passed. */
+	protected void quietPeriodOver(long eventId) {
+		redis.opsForValue().set("ticketrush:{event:" + eventId + "}:recovering-since", "0");
 	}
 
 	/** Waits until nothing is in flight and both stores tell the same story (see {@link #assertStoresAgree}). */
@@ -137,13 +170,18 @@ public abstract class AbstractIntegrationTest {
 			.forEach((user, count) -> buyers.put(user, Long.parseLong(count)));
 
 		assertThat(redis.opsForZSet().size(prefix + "outbox")).as("unconfirmed orders").isZero();
+		assertThat(redis.opsForSet().members(prefix + "sent")).as("orders marked sent are held")
+			.allSatisfy(orderId -> assertThat(held).containsKey(orderId));
 		assertThat(held).as("orders Redis holds vs active orders in MySQL").isEqualTo(active);
 		assertThat(redis.opsForValue().get(prefix + "stock")).as("Redis stock")
 			.isEqualTo(String.valueOf(total - sum(held)));
 		assertThat(buyers).as("per-user counts").isEqualTo(perUser);
+		assertThat(Integer.parseInt(Objects.requireNonNullElse(redis.opsForValue().get(prefix + "held"), "0")))
+			.as("held counter").isEqualTo(sum(held));
 		assertThat(eventRepository.findById(eventId).orElseThrow().getAvailableTickets()).as("MySQL stock")
 			.isEqualTo(total - sum(active));
-		for (Order order : stored) {
+		// A rejected order never held tickets for the client; its key may have been forgotten for a retry.
+		for (Order order : stored.stream().filter(o -> o.getStatus() != OrderStatus.REJECTED).toList()) {
 			assertThat(redis.opsForValue().get(prefix + "idem:" + order.getUserId() + ":" + order.getIdempotencyKey()))
 				.as("idempotency key of %s", order.getId())
 				.isEqualTo(order.getId());

@@ -27,7 +27,7 @@ class OrderRequestPublisherTest {
 	OrderRequestPublisher publisher = new OrderRequestPublisher(kafka,
 			new TicketrushProperties(new Orders("orders", 1, Duration.ofMinutes(10), Duration.ofSeconds(15), 10),
 					new Reservations(Duration.ofHours(1), Duration.ofMillis(50), Duration.ofSeconds(10),
-							Duration.ofSeconds(30), Duration.ofSeconds(2)),
+							Duration.ofSeconds(30), Duration.ofSeconds(2), Duration.ofSeconds(12)),
 					null, null, null));
 
 	private Delivery publish() {

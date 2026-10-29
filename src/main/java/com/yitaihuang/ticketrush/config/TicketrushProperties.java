@@ -27,10 +27,12 @@ public record TicketrushProperties(Orders orders, Reservations reservations, Rat
 	 * @param maxUnconfirmedAge if an event's oldest unconfirmed order is older than this, new reservations for it
 	 * are refused until Kafka catches up
 	 * @param relayInterval how often the relay looks for unconfirmed orders
+	 * @param recoveryQuietPeriod after Redis lost an event's data, how long to wait before rebuilding it; must
+	 * exceed the producer's max.block.ms + delivery.timeout.ms, so sends from before the loss have landed or failed
 	 */
 	public record Reservations(Duration idempotencyTtl, Duration publishTimeout,
 			@DefaultValue("PT10S") Duration republishAfter, @DefaultValue("PT30S") Duration maxUnconfirmedAge,
-			@DefaultValue("PT2S") Duration relayInterval) {
+			@DefaultValue("PT2S") Duration relayInterval, @DefaultValue("PT12S") Duration recoveryQuietPeriod) {
 	}
 
 	/**

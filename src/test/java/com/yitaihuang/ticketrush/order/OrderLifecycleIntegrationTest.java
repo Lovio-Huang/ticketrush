@@ -64,6 +64,7 @@ class OrderLifecycleIntegrationTest extends AbstractIntegrationTest {
 	void redeliveredKafkaMessagesDoNotCreateDuplicateOrders() {
 		long eventId = createEvent(5, 4);
 		var request = new OrderRequested(UUID.randomUUID().toString(), eventId, "heidi", 1, 2500, "k", Instant.now());
+		stock.reserve(eventId, "heidi", 1, 4, "k", request.orderId(), json.writeValueAsString(request));
 
 		orderService.recordRequest(request);
 		orderService.recordRequest(request);
