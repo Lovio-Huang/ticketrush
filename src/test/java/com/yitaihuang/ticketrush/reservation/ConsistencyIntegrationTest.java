@@ -108,7 +108,7 @@ class ConsistencyIntegrationTest extends AbstractIntegrationTest {
 		String user = user("lost-reply");
 		String orderId = UUID.randomUUID().toString();
 		// reserve.lua ran, but the reply never reached the app, so nothing was published.
-		stock.reserve(eventId, user, 1, 4, "k1", orderId, orderJson(orderId, eventId, user, 1, "k1"));
+		stock.reserve(eventId, user, 1, 4, "k1", orderId, orderJson(orderId, eventId, user, 1, "k1"), SALE_OPEN);
 
 		ReservationService.Result retry = reservations.reserve(eventId, user, 1, "k1");
 		relay.relay(eventId);
@@ -205,7 +205,7 @@ class ConsistencyIntegrationTest extends AbstractIntegrationTest {
 		String user = user("redeliver");
 		String orderId = UUID.randomUUID().toString();
 		String message = orderJson(orderId, eventId, user, 2, "k1");
-		stock.reserve(eventId, user, 2, 4, "k1", orderId, message);
+		stock.reserve(eventId, user, 2, 4, "k1", orderId, message, SALE_OPEN);
 
 		consumer.onOrderRequested(message);
 		consumer.onOrderRequested(message);
@@ -265,7 +265,7 @@ class ConsistencyIntegrationTest extends AbstractIntegrationTest {
 		withConsumerStopped(() -> {
 			reservations.reserve(eventId, user, 2, "k1"); // in Kafka, not yet in MySQL
 			String unsent = UUID.randomUUID().toString(); // reserved, not even in Kafka yet
-			stock.reserve(eventId, user, 1, 4, "k2", unsent, orderJson(unsent, eventId, user, 1, "k2"));
+			stock.reserve(eventId, user, 1, 4, "k2", unsent, orderJson(unsent, eventId, user, 1, "k2"), SALE_OPEN);
 			await().atMost(Duration.ofSeconds(15)).until(() -> lag.current().orElse(0) > 0);
 
 			reconciler.run();

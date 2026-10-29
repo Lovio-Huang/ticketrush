@@ -110,7 +110,7 @@ class PublishReleaseRaceIntegrationTest extends AbstractIntegrationTest {
 		String user = user("consumer-first");
 		String orderId = UUID.randomUUID().toString();
 		String message = message(orderId, eventId, user, 2, "k1");
-		stock.reserve(eventId, user, 2, 4, "k1", orderId, message);
+		stock.reserve(eventId, user, 2, 4, "k1", orderId, message, SALE_OPEN);
 
 		consumer.onOrderRequested(message); // Kafka delivered it before the request gave up on its send
 
@@ -171,7 +171,7 @@ class PublishReleaseRaceIntegrationTest extends AbstractIntegrationTest {
 
 	private String reserveInRedis(long eventId, String user, int quantity, String key) {
 		String orderId = UUID.randomUUID().toString();
-		stock.reserve(eventId, user, quantity, 4, key, orderId, message(orderId, eventId, user, quantity, key));
+		stock.reserve(eventId, user, quantity, 4, key, orderId, message(orderId, eventId, user, quantity, key), SALE_OPEN);
 		return orderId;
 	}
 

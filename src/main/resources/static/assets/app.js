@@ -260,11 +260,15 @@ async function pollOrder() {
     return;
   }
   renderOrderCard();
-  if (order.data.status === "PROCESSING" && state.order === order) setTimeout(pollOrder, 500);
+  if (state.order !== order) return;
+  if (order.data.status === "PROCESSING") setTimeout(pollOrder, 500);
+  // Waiting for an operator: no point asking twice a second.
+  if (order.data.status === "UNDER_REVIEW") setTimeout(pollOrder, 5000);
 }
 
 const STATUS_CHIP = {
   PROCESSING: "neutral",
+  UNDER_REVIEW: "warn",
   PENDING_PAYMENT: "warn",
   PAID: "ok",
   EXPIRED: "bad",
@@ -290,6 +294,7 @@ function renderOrderCard() {
         ${d?.amountCents != null ? `<dt>Total</dt><dd>${money(d.amountCents)} for ${d.quantity} ticket(s)</dd>` : ""}
         ${status === "PENDING_PAYMENT" ? `<dt>Pay within</dt><dd class="countdown" id="countdown"></dd>` : ""}
       </dl>
+      ${status === "UNDER_REVIEW" ? '<p class="muted small">We couldn\'t confirm this order automatically. Your tickets are held while our team looks into it.</p>' : ""}
       <div class="row">
         ${status === "PENDING_PAYMENT" ? '<button class="primary" id="pay">Pay now</button><button class="danger" id="cancel">Cancel</button>' : ""}
         <button id="replay" title="Sends the identical request again with the same Idempotency-Key">Retry same request</button>

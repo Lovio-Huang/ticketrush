@@ -94,6 +94,7 @@ public class OrderService {
 			// (e.g. it lost data while orders were in flight). MySQL wins.
 			log.warn("Rejecting order {}: event {} has no stock in MySQL", request.orderId(), request.eventId());
 			order = orders.save(Order.rejected(request, now));
+			events.touch(request.eventId()); // its Redis release below is retried by the reconciler
 		}
 		else {
 			order = orders.save(Order.pendingPayment(request, now, properties.orders().paymentWindow()));
