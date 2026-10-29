@@ -2,6 +2,7 @@ package com.yitaihuang.ticketrush.reservation;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -15,6 +16,7 @@ import static org.mockito.Mockito.when;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Optional;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -122,6 +124,53 @@ class ReservationServiceTest {
 	}
 
 	@Test
+	void theSaleClosesExactlyWhenTheEventStarts() {
+		// startsAt == now: closed. One millisecond before: still open (acceptedReservationIsPublished...).
+		EventSnapshot starting = new EventSnapshot(4L, "Now", "Arena", NOW, NOW.minusSeconds(3_600), 100, 2_500, 4);
+		when(catalog.get(4L)).thenReturn(starting);
+
+		assertThatThrownBy(() -> service.reserve(4L, "alice", 1, "key-1")).isInstanceOfSatisfying(ApiException.class,
+				ex -> {
+					assertThat(ex.getStatus()).isEqualTo(HttpStatus.CONFLICT);
+					assertThat(ex.getCode()).isEqualTo("SALE_ENDED");
+				});
+		verify(stock, never()).reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(),
+				anyString(), any());
+		verifyNoInteractions(publisher);
+	}
+
+	@Test
+	void oneMillisecondBeforeTheEventStartsTheSaleIsStillOpen() {
+		EventSnapshot almost = new EventSnapshot(5L, "Almost", "Arena", NOW.plusMillis(1), NOW.minusSeconds(3_600), 100,
+				2_500, 4);
+		when(catalog.get(5L)).thenReturn(almost);
+		givenRedisAnswers(Outcome.RESERVED);
+
+		assertThat(service.reserve(5L, "alice", 1, "key-1").replayed()).isFalse();
+	}
+
+	@Test
+	void afterTheEventStartsARetryOfAnAcceptedRequestStillGetsItsOrder() {
+		EventSnapshot started = new EventSnapshot(6L, "Started", "Arena", NOW.minusSeconds(60), NOW.minusSeconds(3_600),
+				100, 2_500, 4);
+		when(catalog.get(6L)).thenReturn(started);
+		when(stock.acceptedOrderId(6L, "alice", "key-1")).thenReturn(Optional.of("order-1"));
+
+		ReservationService.Result retry = service.reserve(6L, "alice", 1, "key-1");
+
+		assertThat(retry.orderId()).isEqualTo("order-1");
+		assertThat(retry.replayed()).isTrue();
+		verify(stock, never()).reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(),
+				anyString(), any());
+		verifyNoInteractions(publisher);
+		// A different key (or another user) is a new request: refused.
+		assertThatThrownBy(() -> service.reserve(6L, "alice", 1, "key-2"))
+			.hasFieldOrPropertyWithValue("code", "SALE_ENDED");
+		assertThatThrownBy(() -> service.reserve(6L, "bob", 1, "key-1"))
+			.hasFieldOrPropertyWithValue("code", "SALE_ENDED");
+	}
+
+	@Test
 	void redisStoresTheSameMessageThatIsPublished() {
 		givenRedisAnswers(Outcome.RESERVED);
 
@@ -129,14 +178,14 @@ class ReservationServiceTest {
 
 		ArgumentCaptor<String> stored = ArgumentCaptor.captor();
 		ArgumentCaptor<String> published = ArgumentCaptor.captor();
-		verify(stock).reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(), stored.capture());
+		verify(stock).reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(), stored.capture(), any());
 		verify(publisher).publish(anyLong(), anyString(), published.capture());
 		assertThat(published.getValue()).isEqualTo(stored.getValue());
 	}
 
 	@Test
 	void duplicateRequestReturnsTheOriginalOrderWithoutPublishingAgain() {
-		when(stock.reserve(eq(1L), eq("alice"), eq(1), eq(4), eq("key-1"), anyString(), anyString()))
+		when(stock.reserve(eq(1L), eq("alice"), eq(1), eq(4), eq("key-1"), anyString(), anyString(), any()))
 			.thenReturn(new Reservation(Outcome.DUPLICATE, "original-order"));
 
 		ReservationService.Result result = service.reserve(1L, "alice", 1, "key-1");
@@ -225,7 +274,7 @@ class ReservationServiceTest {
 	@Test
 	void missingRedisStateIsRebuiltAndTheReservationRetried() {
 		when(recovery.rebuild(1L)).thenReturn(true);
-		when(stock.reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(), anyString()))
+		when(stock.reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(), anyString(), any()))
 			.thenReturn(new Reservation(Outcome.NOT_INITIALIZED, ""))
 			.thenAnswer(inv -> new Reservation(Outcome.RESERVED, inv.getArgument(5)));
 
@@ -245,7 +294,7 @@ class ReservationServiceTest {
 	}
 
 	private void givenRedisAnswers(Outcome outcome) {
-		when(stock.reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(), anyString()))
+		when(stock.reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(), anyString(), any()))
 			.thenAnswer(inv -> new Reservation(outcome, outcome == Outcome.RESERVED ? inv.getArgument(5) : ""));
 	}
 

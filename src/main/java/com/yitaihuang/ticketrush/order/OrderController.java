@@ -1,6 +1,7 @@
 package com.yitaihuang.ticketrush.order;
 
 import java.time.Instant;
+import java.util.Optional;
 
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
@@ -28,9 +29,12 @@ public class OrderController {
 
 	private final PendingOrderTracker pendingOrders;
 
-	public OrderController(OrderService orders, PendingOrderTracker pendingOrders) {
+	private final OrderFailureService failures;
+
+	public OrderController(OrderService orders, PendingOrderTracker pendingOrders, OrderFailureService failures) {
 		this.orders = orders;
 		this.pendingOrders = pendingOrders;
+		this.failures = failures;
 	}
 
 	@JsonInclude(JsonInclude.Include.NON_NULL)
@@ -44,6 +48,12 @@ public class OrderController {
 
 		static OrderResponse processing(String orderId) {
 			return new OrderResponse(orderId, "PROCESSING", null, null, null, null, null);
+		}
+
+		/** What the customer asked for, without the failure's internals (error, payload, operator notes). */
+		static OrderResponse of(OrderRequested request, String status) {
+			return new OrderResponse(request.orderId(), status, request.eventId(), request.quantity(),
+					request.amountCents(), null, null);
 		}
 
 	}
@@ -60,12 +70,30 @@ public class OrderController {
 	@GetMapping("/{orderId}")
 	public OrderResponse get(@PathVariable String orderId, @AuthenticationPrincipal Jwt jwt) {
 		String userId = jwt.getSubject();
-		return orders.find(orderId, userId).map(OrderResponse::of).orElseGet(() -> {
-			if (pendingOrders.isProcessingFor(orderId, userId)) {
-				return OrderResponse.processing(orderId);
-			}
-			throw ApiException.notFound("ORDER_NOT_FOUND", "Order " + orderId + " does not exist");
-		});
+		return orders.find(orderId, userId)
+			.map(OrderResponse::of)
+			.or(() -> failures.findForCustomer(orderId, userId).flatMap(OrderController::shownAs))
+			.orElseGet(() -> {
+				if (pendingOrders.isProcessingFor(orderId, userId)) {
+					return OrderResponse.processing(orderId);
+				}
+				throw ApiException.notFound("ORDER_NOT_FOUND", "Order " + orderId + " does not exist");
+			});
+	}
+
+	/**
+	 * A dead-lettered order that isn't in the orders table (yet): accepted, its
+	 * tickets held, waiting for an operator (UNDER_REVIEW); sent again
+	 * (PROCESSING, until the stored order takes over); or given up (REJECTED).
+	 * A discarded one always has its order stored, which is shown instead.
+	 */
+	private static Optional<OrderResponse> shownAs(OrderFailureService.CustomerView failure) {
+		return switch (failure.status()) {
+			case OPEN -> Optional.of(OrderResponse.of(failure.request(), "UNDER_REVIEW"));
+			case REPLAYED -> Optional.of(OrderResponse.of(failure.request(), "PROCESSING"));
+			case VOIDED -> Optional.of(OrderResponse.of(failure.request(), "REJECTED"));
+			case DISCARDED -> Optional.empty();
+		};
 	}
 
 	@PostMapping("/{orderId}/payment")

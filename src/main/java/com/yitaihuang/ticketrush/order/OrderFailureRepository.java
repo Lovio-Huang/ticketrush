@@ -17,6 +17,8 @@ public interface OrderFailureRepository extends JpaRepository<OrderFailure, Long
 	@Query("select f from OrderFailure f where f.orderId = :orderId")
 	Optional<OrderFailure> lockByOrderId(String orderId);
 
+	Optional<OrderFailure> findByOrderId(String orderId);
+
 	@Lock(LockModeType.PESSIMISTIC_WRITE)
 	@Query("select f from OrderFailure f where f.id = :id")
 	Optional<OrderFailure> lockById(long id);

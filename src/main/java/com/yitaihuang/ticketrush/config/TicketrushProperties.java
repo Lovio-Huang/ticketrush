@@ -56,8 +56,10 @@ public record TicketrushProperties(Orders orders, Reservations reservations, Rat
 
 	/**
 	 * @param interval how often Redis is checked against MySQL
+	 * @param settleAfter how long after an event starts the jobs keep visiting it at
+	 * least, past the payment window and any clock skew between the app and Redis
 	 */
-	public record Reconciliation(Duration interval) {
+	public record Reconciliation(Duration interval, @DefaultValue("PT1H") Duration settleAfter) {
 	}
 
 }

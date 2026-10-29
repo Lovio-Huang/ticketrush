@@ -94,6 +94,9 @@ ticketrush:
     auth-requests-per-minute-per-address: 30
   reconciliation:
     interval: PT30S
+    # Events stay in the background jobs' list at least this long after they start
+    # (past the payment window and any app/Redis clock skew), then until settled.
+    settle-after: PT1H
 
 springdoc:
   swagger-ui:

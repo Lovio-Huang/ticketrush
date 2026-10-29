@@ -18,6 +18,7 @@
 -- ARGV[5] idempotency key TTL in seconds
 -- ARGV[6] order JSON (the Kafka message)
 -- ARGV[7] max age in ms of an unconfirmed order before new reservations are paused
+-- ARGV[8] end of the sale (the event's start), epoch ms, compared with Redis's clock
 --
 -- Returns {outcome, orderId}
 
@@ -26,13 +27,19 @@ if existing then
     return {'DUPLICATE', existing}
 end
 
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+-- After the duplicate check, so a retry of an order accepted before the end still finds it.
+-- The app checked its own clock already; this catches a request that paused past the end.
+if now >= tonumber(ARGV[8]) then
+    return {'SALE_ENDED', ''}
+end
+
 local stock = redis.call('GET', KEYS[1])
 if not stock then
     return {'NOT_INITIALIZED', ''}
 end
 
-local t = redis.call('TIME')
-local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local oldest = redis.call('ZRANGE', KEYS[5], 0, 0, 'WITHSCORES')
 if oldest[2] and now - tonumber(oldest[2]) > tonumber(ARGV[7]) then
     -- Kafka hasn't confirmed an order for a while: stop taking new ones until it catches up.

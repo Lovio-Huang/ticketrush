@@ -80,6 +80,9 @@ public abstract class AbstractIntegrationTest {
 	@Autowired
 	private KafkaListenerEndpointRegistry listeners;
 
+	/** A sale end far enough away for orders reserved straight in Redis, as {@link #createEvent} events have. */
+	protected static final Instant SALE_OPEN = Instant.now().plus(30, ChronoUnit.DAYS);
+
 	/** Test users by name, each with a stable numeric id: the JWT subject the API sees. */
 	private static final Map<String, Long> USER_IDS = new ConcurrentHashMap<>();
 
