@@ -26,8 +26,10 @@ import com.yitaihuang.ticketrush.config.TicketrushProperties;
  * each check-and-update is atomic; that is what prevents overselling under
  * thousands of concurrent requests without locking a database row.
  *
- * <p>Every key for an event shares the {@code {event:<id>}} hash tag, so the
- * scripts keep working if Redis is moved to a cluster.
+ * <p>Every key for an event shares the {@code {event:<id>}} hash tag, so each
+ * per-event script touches one slot. Only a single Redis server is supported:
+ * the restart check and its wipe span every event and the global server keys,
+ * which a Redis Cluster would refuse as cross-slot.
  */
 @Component
 public class StockGateway {
@@ -44,6 +46,12 @@ public class StockGateway {
 
 	private static final RedisScript<Long> RESTART_CLAIM = RedisScript
 		.of(new ClassPathResource("redis/restart_claim.lua"), Long.class);
+
+	private static final RedisScript<Long> WIPE_BATCH = RedisScript.of(new ClassPathResource("redis/wipe_batch.lua"),
+			Long.class);
+
+	private static final RedisScript<Long> RESTART_TRUST = RedisScript
+		.of(new ClassPathResource("redis/restart_trust.lua"), Long.class);
 
 	private static final RedisScript<Long> SEED = RedisScript.of(new ClassPathResource("redis/seed.lua"), Long.class);
 
@@ -298,45 +306,68 @@ public class StockGateway {
 
 	}
 
-	/** Compares the server with the trusted one and takes the wipe lock if they differ, atomically (restart_claim.lua). */
-	public RestartCheck checkServer(String server, Duration wipeLease) {
+	/**
+	 * Compares the server with the trusted one and, if they differ, takes the wipe
+	 * lock for {@code owner}, atomically (restart_claim.lua). The owner token must
+	 * be new for every attempt: it is what tells a wiper apart from one that lost
+	 * its lease, since both see the same run_id.
+	 */
+	public RestartCheck checkServer(String server, Duration wipeLease, String owner) {
 		Long result = redis.execute(RESTART_CLAIM, List.of(RedisRestartGuard.SERVER_KEY, RedisRestartGuard.WIPE_LOCK),
-				server, String.valueOf(wipeLease.toMillis()));
+				server, String.valueOf(wipeLease.toMillis()), owner);
 		return RestartCheck.values()[result.intValue()];
 	}
 
-	public void trustServer(String server) {
-		redis.opsForValue().set(RedisRestartGuard.SERVER_KEY, server);
-		redis.delete(RedisRestartGuard.WIPE_LOCK);
+	/** Trusts the server and frees the wipe lock, only if {@code owner} still holds it (restart_trust.lua). */
+	public boolean trustServer(String server, String owner) {
+		Long trusted = redis.execute(RESTART_TRUST, List.of(RedisRestartGuard.SERVER_KEY, RedisRestartGuard.WIPE_LOCK),
+				server, owner);
+		return trusted != null && trusted == 1;
 	}
 
 	/**
 	 * Deletes every event's Redis state, for when Redis can't be trusted to have
 	 * all of it (see {@link RedisRestartGuard}). Stock keys go first, so each
 	 * event stops taking reservations at once and is then rebuilt from MySQL.
+	 * Each batch is deleted only while {@code owner} holds the wipe lock, and
+	 * renews it; empty once the lock is lost, with nothing more deleted.
 	 */
-	public int wipeAllEvents() {
-		return unlinkMatching("ticketrush:{event:*}:stock") + unlinkMatching("ticketrush:{event:*");
+	public OptionalInt wipeAllEvents(String owner, Duration lease) {
+		int stocks = unlinkMatching("ticketrush:{event:*}:stock", owner, lease);
+		int rest = stocks < 0 ? -1 : unlinkMatching("ticketrush:{event:*", owner, lease);
+		return rest < 0 ? OptionalInt.empty() : OptionalInt.of(stocks + rest);
 	}
 
-	private int unlinkMatching(String pattern) {
+	/** The keys deleted, or -1 as soon as {@code owner} no longer holds the wipe lock. */
+	private int unlinkMatching(String pattern, String owner, Duration lease) {
 		List<String> batch = new ArrayList<>();
 		int deleted = 0;
 		try (Cursor<String> keys = redis.scan(ScanOptions.scanOptions().match(pattern).count(1000).build())) {
 			while (keys.hasNext()) {
 				batch.add(keys.next());
 				if (batch.size() == 500) {
+					if (!unlinkOwned(batch, owner, lease)) {
+						return -1;
+					}
 					deleted += batch.size();
-					redis.unlink(batch);
 					batch.clear();
 				}
 			}
 		}
-		if (!batch.isEmpty()) {
-			deleted += batch.size();
-			redis.unlink(batch);
+		// Also run when the batch is empty: it confirms the lock is still ours.
+		if (!unlinkOwned(batch, owner, lease)) {
+			return -1;
 		}
-		return deleted;
+		return deleted + batch.size();
+	}
+
+	/** One atomic step (wipe_batch.lua): check that {@code owner} holds the wipe lock, renew it, delete the keys. */
+	boolean unlinkOwned(List<String> batch, String owner, Duration lease) {
+		List<String> keys = new ArrayList<>(batch.size() + 1);
+		keys.add(RedisRestartGuard.WIPE_LOCK);
+		keys.addAll(batch);
+		Long result = redis.execute(WIPE_BATCH, keys, owner, String.valueOf(lease.toMillis()));
+		return result != null && result >= 0;
 	}
 
 	public void initialize(long eventId, int available) {
