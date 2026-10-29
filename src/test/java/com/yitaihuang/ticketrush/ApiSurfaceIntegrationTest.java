@@ -2,11 +2,16 @@ package com.yitaihuang.ticketrush;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
+
+import com.yitaihuang.ticketrush.event.CreateEventRequest;
 
 /** What a browser or API client sees around the business endpoints: console, docs, error shape. */
 class ApiSurfaceIntegrationTest extends AbstractIntegrationTest {
@@ -45,6 +50,38 @@ class ApiSurfaceIntegrationTest extends AbstractIntegrationTest {
 			.bodyJson()
 			.extractingPath("$.code")
 			.isEqualTo("INVALID_REQUEST");
+	}
+
+	@Test
+	void aTicketPriceAboveTheSupportedMaximumIsRefused() {
+		String event = """
+				{"name":"Gala","venue":"Hall","startsAt":"%s","saleStartsAt":"%s",
+				 "totalTickets":10,"priceCents":%d,"perUserLimit":10}
+				""";
+		Instant startsAt = Instant.now().plus(30, ChronoUnit.DAYS);
+
+		assertThat(mvc.post().uri("/api/events").header("Authorization", adminBearer())
+			.contentType(MediaType.APPLICATION_JSON)
+			.content(event.formatted(startsAt, Instant.now(), 100_000_001))).hasStatus(HttpStatus.BAD_REQUEST)
+			.bodyJson()
+			.extractingPath("$.code")
+			.isEqualTo("INVALID_REQUEST");
+		assertThat(mvc.post().uri("/api/events").header("Authorization", adminBearer())
+			.contentType(MediaType.APPLICATION_JSON)
+			.content(event.formatted(startsAt, Instant.now(), 100_000_000))).hasStatus(HttpStatus.CREATED);
+	}
+
+	@Test
+	void theLargestSupportedOrderAmountIsStoredExactly() {
+		Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+		long eventId = eventService.create(new CreateEventRequest("Gala", "Hall", now.plus(30, ChronoUnit.DAYS),
+				now.minus(1, ChronoUnit.MINUTES), 10, 100_000_000, 10))
+			.id();
+
+		String orderId = reserveAndAwaitOrder(eventId, String.valueOf(userId("gala")), 10);
+
+		assertThat(orders.findById(orderId).orElseThrow().getAmountCents()).isEqualTo(1_000_000_000);
+		assertStoresAgree(eventId);
 	}
 
 	@Test

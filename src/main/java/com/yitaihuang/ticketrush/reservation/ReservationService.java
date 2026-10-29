@@ -81,11 +81,21 @@ public class ReservationService {
 					ApiException.conflict("SALE_NOT_STARTED", "Ticket sales open at " + event.saleStartsAt()));
 		}
 
+		int amountCents;
+		try {
+			// Prices are capped so this fits; an event stored before the cap may not.
+			amountCents = Math.multiplyExact(quantity, event.priceCents());
+		}
+		catch (ArithmeticException ex) {
+			throw rejected("amount_out_of_range", ApiException.badRequest("AMOUNT_OUT_OF_RANGE",
+					"The order total is larger than the system supports"));
+		}
+
 		// The order id and message are fixed before Redis sees them, so every retry
 		// and republish of this reservation carries the same identity.
 		String orderId = UUID.randomUUID().toString();
 		String orderJson = json.writeValueAsString(new OrderRequested(orderId, eventId, userId, quantity,
-				quantity * event.priceCents(), idempotencyKey, now));
+				amountCents, idempotencyKey, now));
 		Reservation reservation = stock.reserve(eventId, userId, quantity, event.perUserLimit(), idempotencyKey,
 				orderId, orderJson);
 		if (reservation.outcome() == StockGateway.Outcome.NOT_INITIALIZED && recovery.rebuild(eventId)) {
