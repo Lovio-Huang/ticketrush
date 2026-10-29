@@ -202,9 +202,10 @@ public class OrderFailureService {
 
 	private Optional<OrderRequested> parse(String payload) {
 		try {
+			// A JSON null ("null") reads as no object at all: unreadable, like any other non-order.
 			OrderRequested request = json.readValue(payload, OrderRequested.class);
 			// Our order ids are UUIDs (36 chars, the column size): a longer one can't be an order that holds tickets.
-			return request.orderId() == null || request.orderId().length() > 36 || request.userId() == null
+			return request == null || request.orderId() == null || request.orderId().length() > 36 || request.userId() == null
 					|| request.idempotencyKey() == null ? Optional.empty() : Optional.of(request);
 		}
 		catch (JacksonException | IllegalArgumentException ex) {
