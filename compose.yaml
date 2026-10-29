@@ -9,6 +9,9 @@ services:
       # An admin account for the console, so a fresh stack can create events.
       ADMIN_USERNAME: admin
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-ticketrush-admin}
+      # Token signing key (base64, 32+ bytes). Unset: the app's public development key, fine for a
+      # local demo only. A malformed or too short value stops the app at startup.
+      JWT_SECRET: ${JWT_SECRET:-}
       MYSQL_HOST: mysql
       REDIS_HOST: redis
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
