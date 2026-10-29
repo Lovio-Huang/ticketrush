@@ -36,6 +36,8 @@ jobs:
           exit 1
       - name: 5,000 users race for 500 tickets
         run: python3 scripts/load_test.py --tickets 500 --users 5000 --concurrency 100
+      - name: 3,000 users, enough tickets for everyone (every order must reach MySQL)
+        run: python3 scripts/load_test.py --tickets 3000 --users 3000 --concurrency 100
       - name: Show logs on failure
         if: failure()
         run: docker compose logs
