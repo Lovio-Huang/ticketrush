@@ -128,6 +128,8 @@ Errors use [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem details wi
 { "status": 409, "code": "SOLD_OUT", "title": "SOLD_OUT", "detail": "No tickets left" }
 ```
 
+**Amounts.** A ticket costs at most 100,000,000 cents ($1,000,000.00); a higher `priceCents` is `400 INVALID_REQUEST`. With at most 10 tickets an order, every total fits the `int` amount columns, and the total is computed with a checked multiply: an event stored before this limit whose total would not fit gets `400 AMOUNT_OUT_OF_RANGE` before any ticket is held.
+
 **Auth.** The app signs its own JWTs and checks the signature, issuer and expiry on every request; the `scope` claim carries `user` or `user admin`. Passwords are BCrypt hashes. Logins are throttled to 5 attempts per minute per username, and sign-ups and logins to 30 per minute per client address, both with the Redis token bucket. Wrong passwords and unknown users get the same answer.
 
 `503` answers are safe to retry with the same `Idempotency-Key`: `ORDER_QUEUE_UNAVAILABLE` (Kafka unreachable or not confirming orders) and `STOCK_RECOVERING` (Redis is being rebuilt, see below).
@@ -182,7 +184,7 @@ What the recovery is built for is **Redis losing everything it had**. Other Redi
 |---|---|---|
 | Restart without persistence (the compose setup: `--save "" --appendonly no`), `FLUSHALL` | Stock keys are gone: `503 STOCK_RECOVERING` at once, then the rebuild below | All of them: no overselling, per-user limits, idempotency, every Kafka-acknowledged order reaches MySQL |
 | Redis comes back with *older* data (an AOF or RDB file, a restored snapshot) while every app instance is down | [`RedisRestartGuard`](src/main/java/com/yitaihuang/ticketrush/reservation/RedisRestartGuard.java): the record of the trusted server's `run_id` comes back with the old data, and `run_id` changes on every start, so the mismatch is certain. An instance refuses reservations and rebuilds until its own check has passed (default deny), and the first check runs when the app is ready | All of them |
-| A *running* app's Redis is replaced by one with older data (a restart with persistence, failover to a replica that was behind) | The same check, every second per instance. Exactly one instance wipes (the compare and the wipe lock are one Lua call), and nobody sells or rebuilds until the wipe is complete; a wiper that dies is redone when its 1-minute lock expires | **Not all, for up to ~1 s per instance** before its check runs: reservations use the old state. MySQL still prevents overselling (Redis may overstate stock; the extra `202`s end `REJECTED`), and Kafka-acknowledged orders still reach MySQL (as `REJECTED` if Redis forgot them). Per-user limits can be exceeded, and a retry whose idempotency key Redis forgot becomes a new attempt (the MySQL unique key turns it into a dead letter instead of a second order). After the check: one wipe, then the rebuild below |
+| A *running* app's Redis is replaced by one with older data (a restart with persistence, failover to a replica that was behind) | The same check, every second per instance. Exactly one instance wipes (the compare and the wipe lock are one Lua call), and nobody sells or rebuilds until the wipe is complete; a wiper that dies is redone when its 1-minute lock expires. The lock holds a token new to each attempt, checked in the same Lua call as every delete batch, lease renewal and the final "trusted" mark, so a wiper that stalled past its lease stops without touching what its successor rebuilt. Only a single Redis server (optionally with replicas and failover) is supported, not Redis Cluster: the wipe and the restart record span all events' keys, which a cluster would refuse as cross-slot | **Not all, for up to ~1 s per instance** before its check runs: reservations use the old state. MySQL still prevents overselling (Redis may overstate stock; the extra `202`s end `REJECTED`), and Kafka-acknowledged orders still reach MySQL (as `REJECTED` if Redis forgot them). Per-user limits can be exceeded, and a retry whose idempotency key Redis forgot becomes a new attempt (the MySQL unique key turns it into a dead letter instead of a second order). After the check: one wipe, then the rebuild below |
 | Some keys of a running server disappear (a hand-made `DEL`; eviction is off with `maxmemory-policy noeviction`) | Not detected | Unsupported; repair by hand (below) |
 
 When an event's stock key is missing, reservations get `503 STOCK_RECOVERING` (retry with the same key) until one instance has rebuilt the event from MySQL: held orders, released markers, per-user counts, idempotency keys, then stock. Before it may start, two things must be true:
@@ -218,7 +220,7 @@ Deleting an event's keys while the app runs is what the guard does on a Redis re
 
 ### Dead-lettered orders
 
-After 3 failed attempts a message goes to `ticket-orders.DLT`. A listener records it in `order_failures` (the payload as received, the root-cause exception, attempt count) and counts it (`ticketrush_orders_dead_lettered_total`; `ticketrush_orders_failures_open` is the number still open, the one to alert on). Its tickets stay held: nothing is guessed. An admin then decides.
+After 3 failed attempts a message goes to `ticket-orders.DLT`. A listener records it in `order_failures` (the payload as received, the root-cause exception, attempt count) and counts it (`ticketrush_orders_dead_lettered_total`; `ticketrush_orders_failures_open` is the number still open, the one to alert on). Its tickets stay held: nothing is guessed. An admin then decides. A payload that isn't one of our orders (malformed JSON, a JSON `null`, an empty or field-less object) is kept as received with no order id, and can only be discarded.
 
 What is kept along the way, and on what it rests:
 
@@ -255,7 +257,13 @@ You need Docker.
 docker compose up --build -d
 ```
 
-Ports bind to `127.0.0.1` and can be moved if something already uses them, e.g. `APP_PORT=18080 MYSQL_PORT=13306 docker compose up -d` (also `REDIS_PORT`, `KAFKA_PORT`). Compose creates an admin account `admin` / `ticketrush-admin`; set `ADMIN_PASSWORD` to change it, and `JWT_SECRET` (base64, 32+ bytes) for anything beyond a local demo.
+Ports bind to `127.0.0.1` and can be moved if something already uses them, e.g. `APP_PORT=18080 MYSQL_PORT=13306 docker compose up -d` (also `REDIS_PORT`, `KAFKA_PORT`). Compose creates an admin account `admin` / `ticketrush-admin`; set `ADMIN_PASSWORD` to change it. Tokens are signed with `JWT_SECRET`, which Compose passes through to the app:
+
+- unset or empty: the public development key (the app logs a warning). Fine for a local demo only, since anyone can sign tokens with it;
+- set, e.g. `JWT_SECRET=$(openssl rand -base64 32) docker compose up -d`: that key and only that key; tokens signed with the development key are refused;
+- not valid base64, or shorter than 32 bytes: the app refuses to start and says why (without printing the value).
+
+The load-test scripts sign their own tokens, so give them the same key (`--jwt-secret` or the `JWT_SECRET` variable).
 
 Open [localhost:8080](http://localhost:8080) for a small console: sign in, browse events, buy, pay, see your orders and, as admin, the sales stats.
 

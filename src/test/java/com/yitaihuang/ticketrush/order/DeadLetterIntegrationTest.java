@@ -243,6 +243,44 @@ class DeadLetterIntegrationTest extends AbstractIntegrationTest {
 	}
 
 	@Test
+	void aJsonNullDeadLetterIsKeptAsUnreadableAndDoesNotBlockTheOnesAfterIt() {
+		long eventId = createEvent(10, 4);
+		String orderId = UUID.randomUUID().toString();
+		String next = reserveInRedis(eventId, orderId, String.valueOf(userId("after-null")), 1);
+		// Same key, same DLT partition: the listener must get past "null" to reach the next one.
+		String dlt = properties.orders().topic() + ".DLT";
+		kafka.send(dlt, "null-key", "null").join();
+		kafka.send(dlt, "null-key", next).join();
+
+		awaitFailure(orderId, f -> true);
+		OrderFailure unreadable = failures.list(Status.OPEN)
+			.stream()
+			.filter(f -> "null".equals(f.getPayload()))
+			.findFirst()
+			.orElseThrow();
+		assertThat(unreadable.getOrderId()).isNull();
+		assertThatThrownBy(() -> failures.voidOrder(unreadable.getId(), null))
+			.hasFieldOrPropertyWithValue("code", "NOT_AN_ORDER");
+		assertThat(failures.discard(unreadable.getId(), "json null").getStatus()).isEqualTo(Status.DISCARDED);
+	}
+
+	@Test
+	void emptyAndShapelessDeadLettersAreRecordedAsUnreadable() {
+		String tag = UUID.randomUUID().toString();
+		String[] payloads = { "", "{}", "[]", "\"" + tag + "\"", "{\"eventId\":1,\"note\":\"" + tag + "\"}" };
+		for (int i = 0; i < payloads.length; i++) {
+			failures.record(payloads[i], "boom", "test-shapeless-" + tag + "@" + i);
+		}
+
+		var recorded = failures.list(Status.OPEN)
+			.stream()
+			.filter(f -> f.getDltPosition().startsWith("test-shapeless-" + tag))
+			.toList();
+		assertThat(recorded).hasSize(5).allSatisfy(f -> assertThat(f.getOrderId()).isNull());
+		recorded.forEach(f -> assertThat(failures.discard(f.getId(), null).getStatus()).isEqualTo(Status.DISCARDED));
+	}
+
+	@Test
 	void anOrderThatStillHoldsTicketsCannotBeDiscarded() {
 		long eventId = createEvent(10, 4);
 		String orderId = UUID.randomUUID().toString();

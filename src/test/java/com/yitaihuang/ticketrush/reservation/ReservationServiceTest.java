@@ -92,6 +92,36 @@ class ReservationServiceTest {
 	}
 
 	@Test
+	void theHighestSupportedPriceTimesTheLargestQuantityIsExact() {
+		EventSnapshot priciest = new EventSnapshot(2L, "Gala", "Arena", NOW.plusSeconds(86_400), NOW.minusSeconds(60),
+				100, 100_000_000, 10);
+		when(catalog.get(2L)).thenReturn(priciest);
+		givenRedisAnswers(Outcome.RESERVED);
+
+		ReservationService.Result result = service.reserve(2L, "alice", 10, "key-1");
+
+		ArgumentCaptor<String> message = ArgumentCaptor.captor();
+		verify(publisher).publish(eq(2L), eq(result.orderId()), message.capture());
+		assertThat(new JsonMapper().readValue(message.getValue(), OrderRequested.class).amountCents())
+			.isEqualTo(1_000_000_000);
+	}
+
+	@Test
+	void anAmountTooLargeToRepresentIsRefusedBeforeAnyTicketIsHeld() {
+		// An event stored before prices were capped: two tickets overflow an int.
+		EventSnapshot legacy = new EventSnapshot(3L, "Legacy", "Arena", NOW.plusSeconds(86_400), NOW.minusSeconds(60),
+				100, Integer.MAX_VALUE, 4);
+		when(catalog.get(3L)).thenReturn(legacy);
+
+		assertThatThrownBy(() -> service.reserve(3L, "alice", 2, "key-1")).isInstanceOfSatisfying(ApiException.class,
+				ex -> {
+					assertThat(ex.getStatus()).isEqualTo(HttpStatus.BAD_REQUEST);
+					assertThat(ex.getCode()).isEqualTo("AMOUNT_OUT_OF_RANGE");
+				});
+		verifyNoInteractions(stock, publisher, pendingOrders);
+	}
+
+	@Test
 	void redisStoresTheSameMessageThatIsPublished() {
 		givenRedisAnswers(Outcome.RESERVED);
 
