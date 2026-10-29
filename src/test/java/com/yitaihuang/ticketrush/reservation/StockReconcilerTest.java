@@ -1,110 +1,119 @@
 package com.yitaihuang.ticketrush.reservation;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
-import java.util.OptionalLong;
+import java.util.List;
+import java.util.OptionalInt;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import com.yitaihuang.ticketrush.event.Event;
 import com.yitaihuang.ticketrush.event.EventRepository;
+import com.yitaihuang.ticketrush.order.Order;
+import com.yitaihuang.ticketrush.order.OrderRepository;
+import com.yitaihuang.ticketrush.order.OrderStatus;
+import com.yitaihuang.ticketrush.reservation.StockGateway.Recount;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
-/** When the reconciler trusts a mismatch enough to fix it, and when it holds back. */
+/** What the reconciler may touch, and what it must leave alone. */
 class StockReconcilerTest {
 
-	EventRepository events = mock(EventRepository.class);
+	EventRepository events = mock();
 
-	StockGateway stock = mock(StockGateway.class);
+	OrderRepository orders = mock();
 
-	OrderQueueLag lag = mock(OrderQueueLag.class);
+	StockGateway stock = mock();
+
+	StockRecovery recovery = mock();
 
 	SimpleMeterRegistry meters = new SimpleMeterRegistry();
+
+	Event event = mock();
 
 	StockReconciler reconciler;
 
 	@BeforeEach
 	void setUp() {
-		reconciler = new StockReconciler(events, stock, lag, meters,
+		reconciler = new StockReconciler(events, orders, stock, recovery, meters,
 				Clock.fixed(Instant.parse("2026-10-28T12:00:00Z"), ZoneOffset.UTC));
-		when(stock.compareAndSet(anyLong(), anyInt(), anyInt())).thenReturn(true);
+		when(event.getId()).thenReturn(1L);
+		when(event.getTotalTickets()).thenReturn(10);
+		when(stock.available(1L)).thenReturn(OptionalInt.of(7));
+		when(stock.recount(1L, 10)).thenReturn(new Recount(7, 7, false));
 	}
 
-	private double corrections() {
-		return meters.counter("ticketrush.stock.corrections").count();
-	}
-
-	@Test
-	void aMismatchSeenOnceIsOnlySuspected() {
-		reconciler.check(1, 10, 7);
-
-		verify(stock, never()).compareAndSet(anyLong(), anyInt(), anyInt());
-	}
-
-	@Test
-	void theSameMismatchTwiceInARowIsFixedByCompareAndSet() {
-		reconciler.check(1, 10, 7);
-		reconciler.check(1, 10, 7);
-
-		verify(stock).compareAndSet(1, 7, 10);
-		assertThat(corrections()).isEqualTo(1);
+	private static Order order(String id, OrderStatus status) {
+		Order order = mock();
+		when(order.getId()).thenReturn(id);
+		when(order.getStatus()).thenReturn(status);
+		return order;
 	}
 
 	@Test
-	void numbersThatKeepMovingAreLeftAlone() {
-		// A sale in progress: both stores change between runs, so the gap isn't settled drift.
-		reconciler.check(1, 10, 7);
-		reconciler.check(1, 9, 6);
-		reconciler.check(1, 8, 5);
+	void ordersMysqlHasFinishedAreReleased() {
+		List<Order> finished = List.of(order("cancelled", OrderStatus.CANCELLED), order("expired", OrderStatus.EXPIRED),
+				order("rejected", OrderStatus.REJECTED));
+		when(stock.heldOrderIds(1L)).thenReturn(List.of("cancelled", "expired", "rejected"));
+		when(orders.findAllById(List.of("cancelled", "expired", "rejected"))).thenReturn(finished);
+		when(stock.release(anyLong(), anyString())).thenReturn(true);
 
-		verify(stock, never()).compareAndSet(anyLong(), anyInt(), anyInt());
+		reconciler.reconcile(event);
+
+		verify(stock).release(1L, "cancelled");
+		verify(stock).release(1L, "expired");
+		verify(stock).release(1L, "rejected");
+		assertThat(meters.counter("ticketrush.stock.late_releases").count()).isEqualTo(3);
 	}
 
 	@Test
-	void agreeingOnceClearsTheSuspicion() {
-		reconciler.check(1, 10, 7);
-		reconciler.check(1, 10, 10);
-		reconciler.check(1, 10, 7);
+	void activeOrdersAndOrdersStillInFlightAreLeftAlone() {
+		// "in-flight" is held in Redis but not in MySQL yet: the consumer hasn't written it.
+		List<Order> active = List.of(order("pending", OrderStatus.PENDING_PAYMENT), order("paid", OrderStatus.PAID));
+		when(stock.heldOrderIds(1L)).thenReturn(List.of("pending", "paid", "in-flight"));
+		when(orders.findAllById(List.of("pending", "paid", "in-flight"))).thenReturn(active);
 
-		verify(stock, never()).compareAndSet(anyLong(), anyInt(), anyInt());
+		reconciler.reconcile(event);
+
+		verify(stock, never()).release(anyLong(), anyString());
 	}
 
 	@Test
-	void aLostCompareAndSetIsNotCounted() {
-		// A reservation landed between the check and the fix; it must not be overwritten.
-		when(stock.compareAndSet(1, 7, 10)).thenReturn(false);
-		reconciler.check(1, 10, 7);
-		reconciler.check(1, 10, 7);
+	void stockIsRecountedFromHeldOrdersNotCopiedFromMysql() {
+		when(stock.recount(1L, 10)).thenReturn(new Recount(5, 7, false));
 
-		assertThat(corrections()).isZero();
+		reconciler.reconcile(event);
+
+		verify(stock).recount(1L, 10);
+		verify(event, never()).getAvailableTickets();
+		assertThat(meters.counter("ticketrush.stock.corrections").count()).isEqualTo(1);
 	}
 
 	@Test
-	void aMissingRedisKeyIsSeededFromMysql() {
-		reconciler.check(1, 10, null);
+	void aRecountThatChangesNothingIsNotCounted() {
+		reconciler.reconcile(event);
 
-		verify(stock).initializeIfAbsent(1, 10);
+		assertThat(meters.counter("ticketrush.stock.corrections").count()).isZero();
 	}
 
 	@Test
-	void ordersStillInKafkaOrAnUnknownLagMeanNoChecksAtAll() {
-		when(lag.current()).thenReturn(OptionalLong.of(3));
-		reconciler.run();
-		when(lag.current()).thenReturn(OptionalLong.empty());
-		reconciler.run();
+	void aMissingStockKeyTriggersARebuildInsteadOfARecount() {
+		when(stock.available(1L)).thenReturn(OptionalInt.empty());
 
-		verifyNoInteractions(events);
+		reconciler.reconcile(event);
+
+		verify(recovery).rebuild(1L);
+		verify(stock, never()).recount(anyLong(), org.mockito.ArgumentMatchers.anyInt());
 	}
 
 }

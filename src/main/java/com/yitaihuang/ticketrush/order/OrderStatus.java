@@ -13,6 +13,11 @@ public enum OrderStatus {
 	CANCELLED,
 
 	/** Redis accepted it but MySQL had no stock left (Redis was out of sync). */
-	REJECTED
+	REJECTED;
+
+	/** Whether an order in this state still owns its tickets. */
+	public boolean holdsTickets() {
+		return this == PENDING_PAYMENT || this == PAID;
+	}
 
 }

@@ -2,12 +2,10 @@ package com.yitaihuang.ticketrush.reservation;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -17,23 +15,23 @@ import static org.mockito.Mockito.when;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
-import java.util.Optional;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.http.HttpStatus;
 
 import com.yitaihuang.ticketrush.common.ApiException;
-import com.yitaihuang.ticketrush.event.Event;
 import com.yitaihuang.ticketrush.event.EventCatalog;
-import com.yitaihuang.ticketrush.event.EventRepository;
 import com.yitaihuang.ticketrush.event.EventSnapshot;
 import com.yitaihuang.ticketrush.order.OrderRequested;
 import com.yitaihuang.ticketrush.order.PendingOrderTracker;
+import com.yitaihuang.ticketrush.reservation.OrderRequestPublisher.Delivery;
 import com.yitaihuang.ticketrush.reservation.StockGateway.Outcome;
 import com.yitaihuang.ticketrush.reservation.StockGateway.Reservation;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import tools.jackson.databind.json.JsonMapper;
 
 class ReservationServiceTest {
 
@@ -44,9 +42,9 @@ class ReservationServiceTest {
 
 	private final EventCatalog catalog = mock();
 
-	private final EventRepository events = mock();
-
 	private final StockGateway stock = mock();
+
+	private final StockRecovery recovery = mock();
 
 	private final RateLimiter rateLimiter = mock();
 
@@ -60,8 +58,9 @@ class ReservationServiceTest {
 
 	@BeforeEach
 	void setUp() {
-		service = new ReservationService(catalog, events, stock, rateLimiter, publisher, pendingOrders, meters,
-				Clock.fixed(NOW, ZoneOffset.UTC));
+		service = new ReservationService(catalog, stock, recovery, rateLimiter, publisher, pendingOrders,
+				new JsonMapper(), meters, Clock.fixed(NOW, ZoneOffset.UTC));
+		when(publisher.publish(anyLong(), anyString(), anyString())).thenReturn(Delivery.ACKED);
 		when(rateLimiter.tryAcquire(anyString())).thenReturn(true);
 		when(catalog.get(1L)).thenReturn(EVENT);
 	}
@@ -73,31 +72,72 @@ class ReservationServiceTest {
 		ReservationService.Result result = service.reserve(1L, "alice", 2, "key-1");
 
 		assertThat(result.replayed()).isFalse();
-		verify(publisher).publish(new OrderRequested(result.orderId(), 1L, "alice", 2, 5_000, "key-1", NOW));
+		ArgumentCaptor<String> message = ArgumentCaptor.captor();
+		verify(publisher).publish(eq(1L), eq(result.orderId()), message.capture());
+		assertThat(new JsonMapper().readValue(message.getValue(), OrderRequested.class))
+			.isEqualTo(new OrderRequested(result.orderId(), 1L, "alice", 2, 5_000, "key-1", NOW));
+		verify(stock).markPublished(1L, result.orderId());
 		verify(pendingOrders).markProcessing(result.orderId(), "alice");
 		assertThat(meters.counter("ticketrush.reservations", "outcome", "accepted").count()).isEqualTo(1);
 	}
 
 	@Test
+	void redisStoresTheSameMessageThatIsPublished() {
+		givenRedisAnswers(Outcome.RESERVED);
+
+		service.reserve(1L, "alice", 2, "key-1");
+
+		ArgumentCaptor<String> stored = ArgumentCaptor.captor();
+		ArgumentCaptor<String> published = ArgumentCaptor.captor();
+		verify(stock).reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(), stored.capture());
+		verify(publisher).publish(anyLong(), anyString(), published.capture());
+		assertThat(published.getValue()).isEqualTo(stored.getValue());
+	}
+
+	@Test
 	void duplicateRequestReturnsTheOriginalOrderWithoutPublishingAgain() {
-		when(stock.reserve(eq(1L), eq("alice"), eq(1), eq(4), eq("key-1"), anyString()))
+		when(stock.reserve(eq(1L), eq("alice"), eq(1), eq(4), eq("key-1"), anyString(), anyString()))
 			.thenReturn(new Reservation(Outcome.DUPLICATE, "original-order"));
 
 		ReservationService.Result result = service.reserve(1L, "alice", 1, "key-1");
 
 		assertThat(result).isEqualTo(new ReservationService.Result("original-order", true));
 		verifyNoInteractions(publisher);
+		verify(pendingOrders).markProcessing("original-order", "alice");
 	}
 
 	@Test
-	void ticketsAreReturnedWhenKafkaIsUnavailable() {
+	void ticketsAreReturnedWhenTheOrderDefinitelyWasNotSent() {
 		givenRedisAnswers(Outcome.RESERVED);
-		doThrow(new RuntimeException("broker down")).when(publisher).publish(any());
+		when(publisher.publish(anyLong(), anyString(), anyString())).thenReturn(Delivery.NOT_SENT);
 
 		assertThatThrownBy(() -> service.reserve(1L, "alice", 2, "key-1")).isInstanceOf(ApiException.class)
 			.hasFieldOrPropertyWithValue("status", HttpStatus.SERVICE_UNAVAILABLE);
-		verify(stock).releaseAndForget(1L, "alice", 2, "key-1");
+		verify(stock).releaseAndForget(eq(1L), anyString(), eq("alice"), eq("key-1"));
 		verify(pendingOrders, never()).markProcessing(anyString(), anyString());
+	}
+
+	@Test
+	void anUnconfirmedSendKeepsTheTicketsAndLeavesTheOrderToTheRelay() {
+		givenRedisAnswers(Outcome.RESERVED);
+		when(publisher.publish(anyLong(), anyString(), anyString())).thenReturn(Delivery.UNKNOWN);
+
+		ReservationService.Result result = service.reserve(1L, "alice", 2, "key-1");
+
+		assertThat(result.replayed()).isFalse();
+		verify(stock, never()).releaseAndForget(anyLong(), anyString(), anyString(), anyString());
+		verify(stock, never()).markPublished(anyLong(), anyString()); // stays in the outbox
+		verify(pendingOrders).markProcessing(result.orderId(), "alice");
+		assertThat(meters.counter("ticketrush.reservations", "outcome", "unconfirmed").count()).isEqualTo(1);
+	}
+
+	@Test
+	void aBackloggedQueueRefusesNewReservations() {
+		givenRedisAnswers(Outcome.QUEUE_BACKLOGGED);
+
+		assertThatThrownBy(() -> service.reserve(1L, "alice", 1, "key-1"))
+			.hasFieldOrPropertyWithValue("code", "ORDER_QUEUE_UNAVAILABLE");
+		verifyNoInteractions(publisher);
 	}
 
 	@Test
@@ -129,22 +169,29 @@ class ReservationServiceTest {
 	}
 
 	@Test
-	void missingRedisStockIsReseededFromMysqlAndRetried() {
-		Event persisted = mock();
-		when(persisted.getAvailableTickets()).thenReturn(42);
-		when(events.findById(1L)).thenReturn(Optional.of(persisted));
-		when(stock.reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString()))
+	void missingRedisStateIsRebuiltAndTheReservationRetried() {
+		when(recovery.rebuild(1L)).thenReturn(true);
+		when(stock.reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(), anyString()))
 			.thenReturn(new Reservation(Outcome.NOT_INITIALIZED, ""))
 			.thenAnswer(inv -> new Reservation(Outcome.RESERVED, inv.getArgument(5)));
 
 		service.reserve(1L, "alice", 1, "key-1");
 
-		verify(stock).initializeIfAbsent(1L, 42);
-		verify(publisher).publish(any());
+		verify(publisher).publish(anyLong(), anyString(), anyString());
+	}
+
+	@Test
+	void whileRedisCannotBeRebuiltYetReservationsAreRefused() {
+		givenRedisAnswers(Outcome.NOT_INITIALIZED);
+		when(recovery.rebuild(1L)).thenReturn(false);
+
+		assertThatThrownBy(() -> service.reserve(1L, "alice", 1, "key-1"))
+			.hasFieldOrPropertyWithValue("code", "STOCK_RECOVERING");
+		verifyNoInteractions(publisher);
 	}
 
 	private void givenRedisAnswers(Outcome outcome) {
-		when(stock.reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString()))
+		when(stock.reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(), anyString()))
 			.thenAnswer(inv -> new Reservation(outcome, outcome == Outcome.RESERVED ? inv.getArgument(5) : ""));
 	}
 

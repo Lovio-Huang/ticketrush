@@ -96,6 +96,13 @@ public class Order {
 		return this.userId.equals(userId);
 	}
 
+	/** Whether {@code request} is the message this order was created from (a redelivery, not a conflict). */
+	boolean isSameRequest(OrderRequested request) {
+		return id.equals(request.orderId()) && eventId == request.eventId() && userId.equals(request.userId())
+				&& quantity == request.quantity() && amountCents == request.amountCents()
+				&& idempotencyKey.equals(request.idempotencyKey());
+	}
+
 	private void requirePendingPayment() {
 		if (status != OrderStatus.PENDING_PAYMENT) {
 			throw ApiException.conflict("INVALID_ORDER_STATE", "Order is " + status);
@@ -137,6 +144,10 @@ public class Order {
 
 	public Instant getCreatedAt() {
 		return createdAt;
+	}
+
+	public String getIdempotencyKey() {
+		return idempotencyKey;
 	}
 
 }

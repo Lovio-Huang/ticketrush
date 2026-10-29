@@ -28,8 +28,13 @@ public class OrderConsumer {
 		try {
 			orders.recordRequest(request);
 		}
-		catch (DataIntegrityViolationException duplicate) {
-			// Another consumer inserted the same order a moment ago (rebalance).
+		catch (DataIntegrityViolationException ex) {
+			// Skip only if this very order is stored (another consumer inserted it a
+			// moment ago, e.g. during a rebalance). Any other constraint error goes
+			// through the error handler: retries, then the dead-letter topic.
+			if (!orders.acknowledgeReplay(request)) {
+				throw ex;
+			}
 			log.info("Order {} was already recorded, skipping redelivery", request.orderId());
 		}
 	}

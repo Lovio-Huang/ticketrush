@@ -22,6 +22,9 @@ import org.springframework.stereotype.Component;
 
 import com.yitaihuang.ticketrush.config.TicketrushProperties;
 
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+
 /**
  * How many accepted orders are still waiting in Kafka for the order consumer.
  * While this is non-zero, Redis is legitimately ahead of MySQL.
@@ -40,10 +43,12 @@ public class OrderQueueLag implements DisposableBean {
 	private final String groupId;
 
 	public OrderQueueLag(KafkaAdmin kafkaAdmin, TicketrushProperties properties,
-			@Value("${spring.kafka.consumer.group-id}") String groupId) {
+			@Value("${spring.kafka.consumer.group-id}") String groupId, MeterRegistry meters) {
 		this.admin = AdminClient.create(kafkaAdmin.getConfigurationProperties());
 		this.topic = properties.orders().topic();
 		this.groupId = groupId;
+		// Read on each scrape: accepted orders not yet written to MySQL (-1 if Kafka can't be asked).
+		Gauge.builder("ticketrush.orders.queue.lag", this, lag -> lag.current().orElse(-1)).register(meters);
 	}
 
 	/** Unprocessed messages across all partitions, or empty if Kafka couldn't be asked. */
