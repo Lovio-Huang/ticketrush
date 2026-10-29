@@ -15,6 +15,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import com.yitaihuang.ticketrush.common.AfterCommit;
 import com.yitaihuang.ticketrush.common.ApiException;
+import com.yitaihuang.ticketrush.event.EventRepository;
 import com.yitaihuang.ticketrush.order.OrderFailure.Status;
 import com.yitaihuang.ticketrush.reservation.OrderRequestPublisher;
 import com.yitaihuang.ticketrush.reservation.OrderRequestPublisher.Delivery;
@@ -48,6 +49,8 @@ public class OrderFailureService {
 
 	private final OrderRepository orders;
 
+	private final EventRepository events;
+
 	private final StockGateway stock;
 
 	private final OrderRequestPublisher publisher;
@@ -60,11 +63,12 @@ public class OrderFailureService {
 
 	private final Clock clock;
 
-	public OrderFailureService(OrderFailureRepository failures, OrderRepository orders, StockGateway stock,
-			OrderRequestPublisher publisher, JsonMapper json, PlatformTransactionManager transactions,
-			MeterRegistry meters, Clock clock) {
+	public OrderFailureService(OrderFailureRepository failures, OrderRepository orders, EventRepository events,
+			StockGateway stock, OrderRequestPublisher publisher, JsonMapper json,
+			PlatformTransactionManager transactions, MeterRegistry meters, Clock clock) {
 		this.failures = failures;
 		this.orders = orders;
+		this.events = events;
 		this.ownTransaction = new TransactionTemplate(transactions);
 		this.ownTransaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
 		this.stock = stock;
@@ -83,6 +87,9 @@ public class OrderFailureService {
 			return; // the DLT listener got this exact record again
 		}
 		OrderRequested request = parse(payload).orElse(null);
+		if (request != null) {
+			events.touch(request.eventId()); // its tickets stay held until someone decides: keep the jobs on it
+		}
 		Optional<OrderFailure> known = request == null ? Optional.empty() : failures.lockByOrderId(request.orderId());
 		if (known.isPresent()) {
 			OrderFailure failure = known.get();
@@ -142,6 +149,7 @@ public class OrderFailureService {
 			recordRejected(request);
 		}
 		failure.resolve(Status.VOIDED, note, clock.instant());
+		events.touch(request.eventId()); // the reconciler retries the release below if it is lost
 		AfterCommit.run(() -> stock.release(request.eventId(), request.orderId()));
 		log.warn("Voided dead-lettered order {}", request.orderId());
 		return failure;
