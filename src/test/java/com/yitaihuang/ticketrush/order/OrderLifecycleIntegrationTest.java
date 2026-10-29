@@ -2,9 +2,7 @@ package com.yitaihuang.ticketrush.order;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.awaitility.Awaitility.await;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -15,19 +13,12 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import com.yitaihuang.ticketrush.AbstractIntegrationTest;
 import com.yitaihuang.ticketrush.common.ApiException;
 import com.yitaihuang.ticketrush.event.EventRepository;
-import com.yitaihuang.ticketrush.reservation.ReservationService;
 import com.yitaihuang.ticketrush.reservation.StockGateway;
 
 class OrderLifecycleIntegrationTest extends AbstractIntegrationTest {
 
 	@Autowired
-	ReservationService reservations;
-
-	@Autowired
 	OrderService orderService;
-
-	@Autowired
-	OrderRepository orders;
 
 	@Autowired
 	OrderExpiryJob expiryJob;
@@ -93,12 +84,6 @@ class OrderLifecycleIntegrationTest extends AbstractIntegrationTest {
 		assertThat(orders.findById(first).orElseThrow().getStatus()).isEqualTo(OrderStatus.PENDING_PAYMENT);
 		assertThat(orders.findById(second).orElseThrow().getStatus()).isEqualTo(OrderStatus.REJECTED);
 		assertThat(events.findById(eventId).orElseThrow().getAvailableTickets()).isZero();
-	}
-
-	private String reserveAndAwaitOrder(long eventId, String userId, int quantity) {
-		String orderId = reservations.reserve(eventId, userId, quantity, UUID.randomUUID().toString()).orderId();
-		await().atMost(Duration.ofSeconds(15)).until(() -> orders.existsById(orderId));
-		return orderId;
 	}
 
 }

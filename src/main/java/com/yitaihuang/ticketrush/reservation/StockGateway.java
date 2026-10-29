@@ -1,7 +1,9 @@
 package com.yitaihuang.ticketrush.reservation;
 
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.OptionalInt;
 
 import org.springframework.core.io.ClassPathResource;
@@ -28,6 +30,9 @@ public class StockGateway {
 
 	private static final RedisScript<Long> RELEASE = RedisScript.of(new ClassPathResource("redis/release.lua"),
 			Long.class);
+
+	private static final RedisScript<Long> COMPARE_AND_SET = RedisScript
+		.of(new ClassPathResource("redis/compare_and_set.lua"), Long.class);
 
 	private final StringRedisTemplate redis;
 
@@ -90,6 +95,28 @@ public class StockGateway {
 	public OptionalInt available(long eventId) {
 		String value = redis.opsForValue().get(stockKey(eventId));
 		return value == null ? OptionalInt.empty() : OptionalInt.of(Integer.parseInt(value));
+	}
+
+	/** Stock for several events in one MGET; events without a Redis key are left out. */
+	public Map<Long, Integer> availableMany(List<Long> eventIds) {
+		Map<Long, Integer> result = new HashMap<>();
+		if (eventIds.isEmpty()) {
+			return result;
+		}
+		List<String> values = redis.opsForValue().multiGet(eventIds.stream().map(StockGateway::stockKey).toList());
+		for (int i = 0; i < eventIds.size(); i++) {
+			if (values != null && values.get(i) != null) {
+				result.put(eventIds.get(i), Integer.parseInt(values.get(i)));
+			}
+		}
+		return result;
+	}
+
+	/** Replaces the stock only if it still equals {@code expected}; returns whether it did. */
+	public boolean compareAndSet(long eventId, int expected, int replacement) {
+		Long replaced = redis.execute(COMPARE_AND_SET, List.of(stockKey(eventId)), String.valueOf(expected),
+				String.valueOf(replacement));
+		return replaced != null && replaced == 1L;
 	}
 
 	static String stockKey(long eventId) {

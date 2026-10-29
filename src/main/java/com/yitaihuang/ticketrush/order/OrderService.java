@@ -7,6 +7,8 @@ import java.util.Optional;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -66,6 +68,12 @@ public class OrderService {
 	public Optional<Order> find(String orderId, String userId) {
 		// Someone else's order looks exactly like a missing one: no ID probing.
 		return orders.findById(orderId).filter(order -> order.isOwnedBy(userId));
+	}
+
+	@Transactional(readOnly = true)
+	public Page<Order> history(String userId, OrderStatus status, Pageable pageable) {
+		return status == null ? orders.findByUserIdOrderByCreatedAtDesc(userId, pageable)
+				: orders.findByUserIdAndStatusOrderByCreatedAtDesc(userId, status, pageable);
 	}
 
 	@Transactional

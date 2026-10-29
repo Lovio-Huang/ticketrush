@@ -65,3 +65,18 @@ ticketrush:
   rate-limit:
     capacity: 10
     refill-per-second: 5
+  security:
+    # Dev-only default (see SecurityConfig.DEV_SECRET); set JWT_SECRET in any real deployment.
+    jwt-secret: ${JWT_SECRET:46nTHWwbEfvhyRNt4EVzb0fs8bOHvuq7D2Wao7h9qn0=}
+    token-ttl: PT1H
+    admin-username: ${ADMIN_USERNAME:}
+    admin-password: ${ADMIN_PASSWORD:}
+    login-attempts-per-minute: 5
+    auth-requests-per-minute-per-address: 30
+  reconciliation:
+    interval: PT30S
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    persist-authorization: true
