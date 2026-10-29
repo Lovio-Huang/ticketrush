@@ -1,6 +1,8 @@
 package com.yitaihuang.ticketrush.reservation;
 
 import java.time.Duration;
+import java.util.OptionalInt;
+import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,7 +27,11 @@ import io.micrometer.core.instrument.MeterRegistry;
  * run_id (new after each restart, different on another server) with the one
  * recorded in Redis itself. On a mismatch exactly one instance (the compare and
  * the wipe lock are one script, restart_claim.lua) deletes every event's keys,
- * stock first, and the fenced rebuild recreates them from MySQL. A missing
+ * stock first, and the fenced rebuild recreates them from MySQL. The lock holds
+ * a token new to each attempt, and every delete batch, lease renewal and the
+ * final "trusted" mark checks it in the same script: a wiper that stalled past
+ * its lease and was taken over stops, without deleting what its successor has
+ * rebuilt since, freeing its lock, or reporting the wipe done. A missing
  * record (a fresh or emptied Redis) counts as a mismatch. The record travels
  * with the data, so a snapshot restored while every app was down carries the
  * old server's id and is caught by the first check.
@@ -92,17 +98,21 @@ public class RedisRestartGuard {
 
 	public void check() {
 		String server = stock.serverRunId();
-		switch (stock.checkServer(server, WIPE_LEASE)) {
+		String owner = UUID.randomUUID().toString();
+		switch (stock.checkServer(server, WIPE_LEASE, owner)) {
 			case TRUSTED -> verified = true;
 			case BUSY -> verified = false; // another instance is wiping
 			case WIPE -> {
 				verified = false;
 				detected.increment();
-				int deleted = stock.wipeAllEvents();
-				stock.trustServer(server);
+				OptionalInt deleted = stock.wipeAllEvents(owner, WIPE_LEASE);
+				if (deleted.isEmpty() || !stock.trustServer(server, owner)) {
+					log.warn("Lost the Redis wipe lock (its lease ran out); the instance that took it over finishes");
+					return;
+				}
 				verified = true;
 				log.error("Redis server changed (now {}): its event state may be old, deleted {} keys to rebuild "
-						+ "from MySQL", server, deleted);
+						+ "from MySQL", server, deleted.getAsInt());
 			}
 		}
 	}
