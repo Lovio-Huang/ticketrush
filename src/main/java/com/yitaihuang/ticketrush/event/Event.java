@@ -35,6 +35,12 @@ public class Event {
 
 	private Instant createdAt;
 
+	/** Set once the sale is over and no accepted order needs the background jobs any more. */
+	private Instant settledAt;
+
+	/** Bumped by every write that may need the background jobs later (see EventRepository#touch). */
+	private long upkeepVersion;
+
 	protected Event() {
 	}
 
@@ -89,6 +95,14 @@ public class Event {
 
 	public Instant getCreatedAt() {
 		return createdAt;
+	}
+
+	public Instant getSettledAt() {
+		return settledAt;
+	}
+
+	public long getUpkeepVersion() {
+		return upkeepVersion;
 	}
 
 }

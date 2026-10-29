@@ -58,7 +58,8 @@ public class OrderOutboxRelay {
 	@Scheduled(fixedDelayString = "${ticketrush.reservations.relay-interval}",
 			initialDelayString = "${ticketrush.reservations.relay-interval}")
 	public void run() {
-		for (Event event : events.findOnSale(clock.instant())) {
+		// Not only events on sale: an order accepted just before the start may still be waiting for Kafka.
+		for (Event event : events.findNeedingUpkeep(clock.instant())) {
 			relay(event.getId());
 		}
 	}
