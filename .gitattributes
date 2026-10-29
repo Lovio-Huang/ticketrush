@@ -1,2 +1,5 @@
 /mvnw text eol=lf
 *.cmd text eol=crlf
+# Saved `git diff` output kept as benchmark evidence: its context lines end in
+# whitespace by design, so whitespace checks skip it.
+perf/results/*/code.diff -whitespace
