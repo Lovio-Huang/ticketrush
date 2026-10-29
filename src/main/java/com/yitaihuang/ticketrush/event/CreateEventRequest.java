@@ -18,8 +18,14 @@ public record CreateEventRequest(
 		@NotNull @Future Instant startsAt,
 		@NotNull Instant saleStartsAt,
 		@Positive @Max(1_000_000) int totalTickets,
-		@PositiveOrZero int priceCents,
+		@PositiveOrZero @Max(MAX_PRICE_CENTS) int priceCents,
 		@Min(1) @Max(10) int perUserLimit) {
+
+	/**
+	 * $1,000,000.00 a ticket: at most 10 tickets an order (the largest quantity
+	 * and purchase limit), every amount fits the int amount_cents of orders.
+	 */
+	public static final int MAX_PRICE_CENTS = 100_000_000;
 
 	@AssertTrue(message = "saleStartsAt must be before startsAt")
 	public boolean isSaleWindowValid() {
