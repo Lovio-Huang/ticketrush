@@ -1,0 +1,1395 @@
+diff --git a/compose.yaml b/compose.yaml
+index 6f042c3..46d6eff 100644
+--- a/compose.yaml
++++ b/compose.yaml
+@@ -36,9 +36,11 @@ services:
+ 
+   redis:
+     image: redis:7.4-alpine
+-    # AOF, fsync every second: a restart loses at most ~1 s of writes instead of
+-    # everything. Never evict: losing an order's key would break the stock invariant.
+-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
++    # No persistence: a restart comes back empty, which the app treats as a full loss
++    # and rebuilds from MySQL. A restart from an AOF/RDB file would bring back an older
++    # state the app can't tell from the real one until its restart check notices
++    # (RedisRestartGuard). Never evict: losing one key would break the stock invariant.
++    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
+     ports:
+       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+     healthcheck:
+diff --git a/src/main/java/com/yitaihuang/ticketrush/config/KafkaConfig.java b/src/main/java/com/yitaihuang/ticketrush/config/KafkaConfig.java
+index c3914af..155fce9 100644
+--- a/src/main/java/com/yitaihuang/ticketrush/config/KafkaConfig.java
++++ b/src/main/java/com/yitaihuang/ticketrush/config/KafkaConfig.java
+@@ -4,7 +4,9 @@ import org.apache.kafka.clients.admin.NewTopic;
+ import org.apache.kafka.common.TopicPartition;
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
++import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+ import org.springframework.kafka.config.TopicBuilder;
++import org.springframework.kafka.core.ConsumerFactory;
+ import org.springframework.kafka.core.KafkaTemplate;
+ import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
+ import org.springframework.kafka.listener.DefaultErrorHandler;
+@@ -39,6 +41,20 @@ public class KafkaConfig {
+ 		return handler;
+ 	}
+ 
++	/**
++	 * For the dead-letter listener: retries forever instead of dead-lettering the
++	 * dead letters. A failure record must not be lost, and the listener only
++	 * fails when MySQL is unavailable.
++	 */
++	@Bean
++	ConcurrentKafkaListenerContainerFactory<String, String> deadLetterContainerFactory(
++			ConsumerFactory<String, String> consumerFactory) {
++		var factory = new ConcurrentKafkaListenerContainerFactory<String, String>();
++		factory.setConsumerFactory(consumerFactory);
++		factory.setCommonErrorHandler(new DefaultErrorHandler(new FixedBackOff(2000L, FixedBackOff.UNLIMITED_ATTEMPTS)));
++		return factory;
++	}
++
+ 	static String deadLetterTopic(String topic) {
+ 		return topic + ".DLT";
+ 	}
+diff --git a/src/main/java/com/yitaihuang/ticketrush/config/SecurityConfig.java b/src/main/java/com/yitaihuang/ticketrush/config/SecurityConfig.java
+index 33fd550..ff81308 100644
+--- a/src/main/java/com/yitaihuang/ticketrush/config/SecurityConfig.java
++++ b/src/main/java/com/yitaihuang/ticketrush/config/SecurityConfig.java
+@@ -76,7 +76,7 @@ public class SecurityConfig {
+ 			.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+ 			.authorizeHttpRequests(auth -> auth
+ 				.requestMatchers("/api/auth/register", "/api/auth/login").permitAll()
+-				.requestMatchers("/api/events/*/stats").hasAuthority("SCOPE_admin")
++				.requestMatchers("/api/events/*/stats", "/api/admin/**").hasAuthority("SCOPE_admin")
+ 				.requestMatchers(HttpMethod.POST, "/api/events").hasAuthority("SCOPE_admin")
+ 				.requestMatchers(HttpMethod.GET, "/api/events", "/api/events/*").permitAll()
+ 				.requestMatchers("/actuator/health/**", "/actuator/info", "/actuator/prometheus").permitAll()
+diff --git a/src/main/java/com/yitaihuang/ticketrush/config/TicketrushProperties.java b/src/main/java/com/yitaihuang/ticketrush/config/TicketrushProperties.java
+index 938f65d..cc89bee 100644
+--- a/src/main/java/com/yitaihuang/ticketrush/config/TicketrushProperties.java
++++ b/src/main/java/com/yitaihuang/ticketrush/config/TicketrushProperties.java
+@@ -27,10 +27,12 @@ public record TicketrushProperties(Orders orders, Reservations reservations, Rat
+ 	 * @param maxUnconfirmedAge if an event's oldest unconfirmed order is older than this, new reservations for it
+ 	 * are refused until Kafka catches up
+ 	 * @param relayInterval how often the relay looks for unconfirmed orders
++	 * @param recoveryQuietPeriod after Redis lost an event's data, how long to wait before rebuilding it; must
++	 * exceed the producer's max.block.ms + delivery.timeout.ms, so sends from before the loss have landed or failed
+ 	 */
+ 	public record Reservations(Duration idempotencyTtl, Duration publishTimeout,
+ 			@DefaultValue("PT10S") Duration republishAfter, @DefaultValue("PT30S") Duration maxUnconfirmedAge,
+-			@DefaultValue("PT2S") Duration relayInterval) {
++			@DefaultValue("PT2S") Duration relayInterval, @DefaultValue("PT12S") Duration recoveryQuietPeriod) {
+ 	}
+ 
+ 	/**
+diff --git a/src/main/java/com/yitaihuang/ticketrush/order/OrderConsumer.java b/src/main/java/com/yitaihuang/ticketrush/order/OrderConsumer.java
+index 6db6868..980eece 100644
+--- a/src/main/java/com/yitaihuang/ticketrush/order/OrderConsumer.java
++++ b/src/main/java/com/yitaihuang/ticketrush/order/OrderConsumer.java
+@@ -1,11 +1,17 @@
+ package com.yitaihuang.ticketrush.order;
+ 
++import java.util.List;
++
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.dao.DataIntegrityViolationException;
+ import org.springframework.kafka.annotation.KafkaListener;
++import org.springframework.kafka.listener.BatchListenerFailedException;
+ import org.springframework.stereotype.Component;
+ 
++import io.micrometer.core.instrument.Counter;
++import io.micrometer.core.instrument.MeterRegistry;
++import io.micrometer.core.instrument.Timer;
+ import tools.jackson.databind.json.JsonMapper;
+ 
+ @Component
+@@ -17,16 +23,55 @@ public class OrderConsumer {
+ 
+ 	private final JsonMapper json;
+ 
+-	public OrderConsumer(OrderService orders, JsonMapper json) {
++	/** One MySQL transaction (a batch, or one message), Redis claims and commit included. */
++	private final Timer writes;
++
++	private final Counter consumed;
++
++	public OrderConsumer(OrderService orders, JsonMapper json, MeterRegistry meters) {
+ 		this.orders = orders;
+ 		this.json = json;
++		this.writes = Timer.builder("ticketrush.orders.write").publishPercentiles(0.5, 0.95, 0.99).register(meters);
++		this.consumed = meters.counter("ticketrush.orders.consumed");
++	}
++
++	/**
++	 * One poll's worth of messages in one transaction. If the batch fails it has
++	 * rolled back as a whole (the Redis claims it made are idempotent and stay),
++	 * and the messages are redone one by one, each in its own transaction. The
++	 * first one that fails again is reported by its index: the error handler
++	 * commits the offsets before it (those orders are stored), retries from it,
++	 * and dead-letters only that message, so a good order is never dropped or
++	 * rejected because of its neighbour.
++	 */
++	@KafkaListener(id = "order-writer", idIsGroup = false, topics = "${ticketrush.orders.topic}", batch = "true")
++	public void onOrderRequests(List<String> payloads) {
++		try {
++			List<OrderRequested> requests = payloads.stream()
++				.map(payload -> json.readValue(payload, OrderRequested.class))
++				.toList();
++			writes.record(() -> orders.recordRequests(requests));
++			consumed.increment(payloads.size());
++			return;
++		}
++		catch (RuntimeException ex) {
++			log.info("Batch of {} order messages failed ({}); retrying them one by one", payloads.size(), ex.toString());
++		}
++		for (int i = 0; i < payloads.size(); i++) {
++			try {
++				onOrderRequested(payloads.get(i));
++			}
++			catch (RuntimeException ex) {
++				// The dead letter's error header carries this message: keep the real cause readable in it.
++				throw new BatchListenerFailedException("Order message " + i + " of the batch failed: " + ex, ex, i);
++			}
++		}
+ 	}
+ 
+-	@KafkaListener(topics = "${ticketrush.orders.topic}")
+ 	public void onOrderRequested(String payload) {
+ 		OrderRequested request = json.readValue(payload, OrderRequested.class);
+ 		try {
+-			orders.recordRequest(request);
++			writes.record(() -> orders.recordRequest(request));
+ 		}
+ 		catch (DataIntegrityViolationException ex) {
+ 			// Skip only if this very order is stored (another consumer inserted it a
+@@ -37,6 +82,7 @@ public class OrderConsumer {
+ 			}
+ 			log.info("Order {} was already recorded, skipping redelivery", request.orderId());
+ 		}
++		consumed.increment();
+ 	}
+ 
+ }
+diff --git a/src/main/java/com/yitaihuang/ticketrush/order/OrderService.java b/src/main/java/com/yitaihuang/ticketrush/order/OrderService.java
+index d699d25..83da995 100644
+--- a/src/main/java/com/yitaihuang/ticketrush/order/OrderService.java
++++ b/src/main/java/com/yitaihuang/ticketrush/order/OrderService.java
+@@ -18,7 +18,10 @@ import com.yitaihuang.ticketrush.common.ApiException;
+ import com.yitaihuang.ticketrush.config.TicketrushProperties;
+ import com.yitaihuang.ticketrush.event.EventRepository;
+ import com.yitaihuang.ticketrush.reservation.StockGateway;
++import com.yitaihuang.ticketrush.reservation.StockGateway.Claim;
+ 
++import io.micrometer.core.instrument.MeterRegistry;
++import io.micrometer.core.instrument.Timer;
+ import tools.jackson.databind.json.JsonMapper;
+ 
+ @Service
+@@ -38,14 +41,28 @@ public class OrderService {
+ 
+ 	private final Clock clock;
+ 
++	private final Timer claims;
++
+ 	public OrderService(OrderRepository orders, EventRepository events, StockGateway stock,
+-			TicketrushProperties properties, JsonMapper json, Clock clock) {
++			TicketrushProperties properties, JsonMapper json, MeterRegistry meters, Clock clock) {
+ 		this.orders = orders;
+ 		this.events = events;
+ 		this.stock = stock;
+ 		this.properties = properties;
+ 		this.json = json;
+ 		this.clock = clock;
++		this.claims = Timer.builder("ticketrush.orders.claim").publishPercentiles(0.5, 0.95, 0.99).register(meters);
++	}
++
++	/**
++	 * Persists a batch of orders in one transaction, one commit: each goes through
++	 * the same steps as {@link #recordRequest} (claim in Redis first, idempotent
++	 * by order id; a repeat within the batch finds the first copy). If anything
++	 * fails, the whole batch rolls back and the caller retries it order by order.
++	 */
++	@Transactional
++	public void recordRequests(List<OrderRequested> requests) {
++		requests.forEach(this::recordRequest);
+ 	}
+ 
+ 	/**
+@@ -61,6 +78,15 @@ public class OrderService {
+ 			syncRedis(requireSameRequest(existing.get(), request), request);
+ 			return;
+ 		}
++		// Claim the order in Redis before giving it tickets in MySQL. The claim is
++		// atomic with releases: if Redis already released it (its request decided it
++		// was never sent), or was rebuilt after a loss without it (its send came after
++		// the rebuild's barrier), it is recorded as rejected and takes no stock.
++		if (claim(request, true) == Claim.RELEASED) {
++			log.warn("Rejecting order {}: Redis released it or was rebuilt without it", request.orderId());
++			orders.save(Order.rejected(request, clock.instant()));
++			return;
++		}
+ 		Instant now = clock.instant();
+ 		Order order;
+ 		if (events.decrementAvailable(request.eventId(), request.quantity()) == 0) {
+@@ -72,7 +98,16 @@ public class OrderService {
+ 		else {
+ 			order = orders.save(Order.pendingPayment(request, now, properties.orders().paymentWindow()));
+ 		}
+-		syncRedis(order, request);
++		if (order.getStatus() == OrderStatus.REJECTED) {
++			AfterCommit.run(() -> stock.release(order.getEventId(), order.getId()));
++		}
++	}
++
++	private Claim claim(OrderRequested request, boolean firstDelivery) {
++		Duration idempotencyLeft = Duration.between(clock.instant(),
++				request.requestedAt().plus(properties.reservations().idempotencyTtl()));
++		return claims.record(() -> stock.confirm(request.eventId(), request.orderId(), request.userId(),
++				request.idempotencyKey(), json.writeValueAsString(request), idempotencyLeft, firstDelivery));
+ 	}
+ 
+ 	/**
+@@ -95,22 +130,21 @@ public class OrderService {
+ 	}
+ 
+ 	/**
+-	 * Brings Redis in line with the order once MySQL has committed: an active
+-	 * order is confirmed (leaves the outbox, re-held if Redis lost it), any other
+-	 * gives its tickets back. Both are idempotent, and a failure here fails the
+-	 * message, so Kafka's redelivery retries it.
++	 * Brings Redis in line with an order MySQL already has (a redelivery): an
++	 * active order is claimed (leaves the outbox, re-held if Redis lost it), any
++	 * other gives its tickets back. Both are idempotent, and a failure here fails
++	 * the message, so Kafka's redelivery retries it.
+ 	 */
+ 	private void syncRedis(Order order, OrderRequested request) {
+-		long eventId = order.getEventId();
+ 		if (order.getStatus().holdsTickets()) {
+-			String orderJson = json.writeValueAsString(request);
+-			Duration idempotencyLeft = Duration.between(clock.instant(),
+-					request.requestedAt().plus(properties.reservations().idempotencyTtl()));
+-			AfterCommit.run(() -> stock.confirm(eventId, order.getId(), order.getUserId(), order.getIdempotencyKey(),
+-					orderJson, idempotencyLeft));
++			AfterCommit.run(() -> {
++				if (claim(request, false) == Claim.RELEASED) {
++					log.error("Order {} is active in MySQL but released in Redis", order.getId());
++				}
++			});
+ 		}
+ 		else {
+-			AfterCommit.run(() -> stock.release(eventId, order.getId()));
++			AfterCommit.run(() -> stock.release(order.getEventId(), order.getId()));
+ 		}
+ 	}
+ 
+diff --git a/src/main/java/com/yitaihuang/ticketrush/reservation/ReservationService.java b/src/main/java/com/yitaihuang/ticketrush/reservation/ReservationService.java
+index aa15373..25d5123 100644
+--- a/src/main/java/com/yitaihuang/ticketrush/reservation/ReservationService.java
++++ b/src/main/java/com/yitaihuang/ticketrush/reservation/ReservationService.java
+@@ -109,10 +109,15 @@ public class ReservationService {
+ 		switch (publisher.publish(eventId, orderId, orderJson)) {
+ 			case ACKED -> stock.markPublished(eventId, orderId);
+ 			case NOT_SENT -> {
+-				// Kafka never got it, so nobody will persist it: give the tickets back.
+-				stock.releaseAndForget(eventId, orderId, userId, idempotencyKey);
+-				throw rejected("queue_unavailable",
+-						ApiException.serviceUnavailable("ORDER_QUEUE_UNAVAILABLE", "Could not place the order, retry"));
++				// Our send never left the producer. Unless the relay or the consumer has
++				// taken the order meanwhile (then a copy may be in Kafka, and the release
++				// is refused), nobody will persist it: give the tickets back.
++				if (stock.releaseAndForget(eventId, orderId, userId, idempotencyKey)) {
++					throw rejected("queue_unavailable", ApiException.serviceUnavailable("ORDER_QUEUE_UNAVAILABLE",
++							"Could not place the order, retry"));
++				}
++				count("unconfirmed");
++				log.warn("Order {} was not sent by this request but was already taken by the relay", orderId);
+ 			}
+ 			case UNKNOWN -> {
+ 				// Kafka may already have it. Releasing now could sell these tickets twice;
+diff --git a/src/main/java/com/yitaihuang/ticketrush/reservation/StockGateway.java b/src/main/java/com/yitaihuang/ticketrush/reservation/StockGateway.java
+index f95ac06..3e4ce6b 100644
+--- a/src/main/java/com/yitaihuang/ticketrush/reservation/StockGateway.java
++++ b/src/main/java/com/yitaihuang/ticketrush/reservation/StockGateway.java
+@@ -6,11 +6,14 @@ import java.util.HashMap;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Optional;
+ import java.util.OptionalInt;
++import java.util.Properties;
+ 
+ import org.springframework.core.io.ClassPathResource;
+ import org.springframework.data.redis.core.Cursor;
+ import org.springframework.data.redis.core.HashOperations;
++import org.springframework.data.redis.core.RedisCallback;
+ import org.springframework.data.redis.core.ScanOptions;
+ import org.springframework.data.redis.core.StringRedisTemplate;
+ import org.springframework.data.redis.core.script.RedisScript;
+@@ -48,6 +51,16 @@ public class StockGateway {
+ 	@SuppressWarnings("rawtypes")
+ 	private static final RedisScript<List> DUE = RedisScript.of(new ClassPathResource("redis/due.lua"), List.class);
+ 
++	@SuppressWarnings("rawtypes")
++	private static final RedisScript<List> REBUILD_BEGIN = RedisScript
++		.of(new ClassPathResource("redis/rebuild_begin.lua"), List.class);
++
++	private static final RedisScript<Long> DRIFT = RedisScript.of(new ClassPathResource("redis/drift.lua"),
++			Long.class);
++
++	private static final RedisScript<Long> REBUILD_LEASE = RedisScript
++		.of(new ClassPathResource("redis/rebuild_lease.lua"), Long.class);
++
+ 	/** Value of a released order in the orders hash. */
+ 	static final String RELEASED = "R";
+ 
+@@ -82,28 +95,30 @@ public class StockGateway {
+ 			String newOrderId, String orderJson) {
+ 		List<String> result = redis.execute(RESERVE,
+ 				List.of(stockKey(eventId), buyersKey(eventId), idempotencyKey(eventId, userId, idempotencyKey),
+-						ordersKey(eventId), outboxKey(eventId)),
++						ordersKey(eventId), outboxKey(eventId), heldKey(eventId)),
+ 				userId, String.valueOf(quantity), String.valueOf(perUserLimit), newOrderId,
+ 				String.valueOf(idempotencyTtl.toSeconds()), orderJson, String.valueOf(maxUnconfirmedAge.toMillis()));
+ 		return new Reservation(Outcome.valueOf(result.get(0)), result.get(1));
+ 	}
+ 
+ 	/**
+-	 * Puts an order's tickets back (expired, cancelled, rejected by MySQL).
++	 * Puts an order's tickets back (expired, cancelled, rejected by MySQL, voided).
+ 	 * Idempotent per order: returns false if it was already released.
+ 	 */
+ 	public boolean release(long eventId, String orderId) {
+-		return Long.valueOf(1).equals(redis.execute(RELEASE, eventKeys(eventId), orderId));
++		return Long.valueOf(1).equals(redis.execute(RELEASE, eventKeys(eventId), orderId, ""));
+ 	}
+ 
+ 	/**
+-	 * Undoes a reservation that definitely never reached Kafka. Also forgets the
+-	 * idempotency key: the request failed, so a retry should get a fresh attempt.
++	 * Undoes a reservation whose own send failed before the record was queued, and
++	 * forgets its idempotency key so a retry gets a fresh attempt. Refused (false)
++	 * if the relay or the consumer has already taken the order: then a copy may be
++	 * in Kafka and the order must stay held.
+ 	 */
+-	public void releaseAndForget(long eventId, String orderId, String userId, String idempotencyKey) {
++	public boolean releaseAndForget(long eventId, String orderId, String userId, String idempotencyKey) {
+ 		List<String> keys = new ArrayList<>(eventKeys(eventId));
+ 		keys.add(idempotencyKey(eventId, userId, idempotencyKey));
+-		redis.execute(RELEASE, keys, orderId);
++		return !Long.valueOf(-1).equals(redis.execute(RELEASE, keys, orderId, "not-sent"));
+ 	}
+ 
+ 	/** Kafka has stored the order: it no longer needs the outbox. */
+@@ -111,16 +126,33 @@ public class StockGateway {
+ 		redis.opsForZSet().remove(outboxKey(eventId), orderId);
+ 	}
+ 
++	public enum Claim {
++
++		/** Redis holds the order; it is now marked sent and out of the outbox. */
++		HELD,
++
++		/** Redis had lost the order (a rebuild is running, or MySQL has it) and holds it again now. */
++		REHELD,
++
++		/** Redis released the order, or was rebuilt without it: it must not get tickets. */
++		RELEASED
++
++	}
++
+ 	/**
+-	 * MySQL holds the order as active. Takes it out of the outbox and, if Redis
+-	 * had lost it, holds its tickets again. Returns whether it had to re-hold.
++	 * The consumer's claim on an order, taken before it writes the order to MySQL
++	 * (see confirm.lua). Atomic with releases: an order is claimed or released,
++	 * never both. {@code firstDelivery} is true when MySQL doesn't have the order:
++	 * then an order Redis doesn't know while the event's state exists was left out
++	 * of a rebuild (it arrived after its barrier), and is released instead.
+ 	 */
+-	public boolean confirm(long eventId, String orderId, String userId, String idempotencyKey, String orderJson,
+-			Duration idempotencyLeft) {
++	public Claim confirm(long eventId, String orderId, String userId, String idempotencyKey, String orderJson,
++			Duration idempotencyLeft, boolean firstDelivery) {
+ 		List<String> keys = new ArrayList<>(eventKeys(eventId));
+ 		keys.add(idempotencyKey(eventId, userId, idempotencyKey));
+-		return Long.valueOf(1).equals(redis.execute(CONFIRM, keys, orderId, orderJson,
+-				String.valueOf(Math.max(0, idempotencyLeft.toSeconds()))));
++		Long result = redis.execute(CONFIRM, keys, orderId, orderJson,
++				String.valueOf(Math.max(0, idempotencyLeft.toSeconds())), firstDelivery ? "new" : "");
++		return result == -1L ? Claim.RELEASED : result == 1L ? Claim.REHELD : Claim.HELD;
+ 	}
+ 
+ 	/** One order to put back during a rebuild: its JSON if active, {@code null} if it no longer holds tickets. */
+@@ -128,20 +160,52 @@ public class StockGateway {
+ 			Duration idempotencyLeft) {
+ 	}
+ 
+-	public void seed(long eventId, List<SeedOrder> batch) {
+-		if (batch.isEmpty()) {
+-			return;
+-		}
+-		List<String> keys = new ArrayList<>(batch.size() + 1);
+-		List<String> args = new ArrayList<>(batch.size() * 3);
++	public enum RebuildStart {
++
++		/** The stock key exists again: nothing to rebuild. */
++		DONE,
++
++		/** Another rebuilder holds the lease. */
++		BUSY,
++
++		/** The quiet period after the loss hasn't passed: sends from before it may still arrive. */
++		WAIT,
++
++		/** This caller holds the lease. */
++		GO
++
++	}
++
++	/** Asks for the right to rebuild (see rebuild_begin.lua). */
++	@SuppressWarnings("unchecked")
++	public RebuildStart beginRebuild(long eventId, String token, Duration lease, Duration quietPeriod) {
++		List<Object> result = redis.execute(REBUILD_BEGIN,
++				List.of(stockKey(eventId), rebuildKey(eventId), recoveringSinceKey(eventId)), token,
++				String.valueOf(lease.toMillis()), String.valueOf(quietPeriod.toMillis()));
++		return RebuildStart.valueOf((String) result.get(0));
++	}
++
++	/** Shortens this caller's lease ({@code Duration.ZERO} drops it); a lease someone else holds is left alone. */
++	public void releaseRebuildLease(long eventId, String token, Duration keepFor) {
++		redis.execute(REBUILD_LEASE, List.of(rebuildKey(eventId)), token, String.valueOf(keepFor.toMillis()));
++	}
++
++	/** Seeds one batch under this caller's lease; false if the lease is no longer theirs. */
++	public boolean seed(long eventId, String token, Duration lease, List<SeedOrder> batch) {
++		List<String> keys = new ArrayList<>(batch.size() + 2);
++		List<String> args = new ArrayList<>(batch.size() * 3 + 2);
++		keys.add(rebuildKey(eventId));
+ 		keys.add(ordersKey(eventId));
++		args.add(token);
++		args.add(String.valueOf(lease.toMillis()));
+ 		for (SeedOrder order : batch) {
+ 			keys.add(idempotencyKey(eventId, order.userId(), order.idempotencyKey()));
+ 			args.add(order.orderId());
+ 			args.add(order.orderJson() == null ? RELEASED : order.orderJson());
+ 			args.add(String.valueOf(Math.max(0, order.idempotencyLeft().toSeconds())));
+ 		}
+-		redis.execute(SEED, keys, args.toArray());
++		Long seeded = redis.execute(SEED, keys, args.toArray());
++		return seeded != null && seeded >= 0;
+ 	}
+ 
+ 	/** Result of {@link #recount}: stock before ({@code -1} if missing) and after, and whether per-user counts moved. */
+@@ -153,14 +217,33 @@ public class StockGateway {
+ 
+ 	}
+ 
+-	/** Atomically sets stock and per-user counts from the held orders (see recount.lua). */
+-	@SuppressWarnings("unchecked")
++	/**
++	 * Atomically resets stock and per-user counts from the held orders on a live
++	 * event (see recount.lua). Does nothing while the stock key is missing.
++	 */
+ 	public Recount recount(long eventId, int totalTickets) {
+-		List<Long> result = redis.execute(RECOUNT,
+-				List.of(stockKey(eventId), buyersKey(eventId), ordersKey(eventId)), String.valueOf(totalTickets));
++		return runRecount(eventId, totalTickets, "");
++	}
++
++	/** The last step of a rebuild: recounts and creates the stock key, if the lease is still this caller's. */
++	public Optional<Recount> finishRebuild(long eventId, String token, int totalTickets) {
++		Recount recount = runRecount(eventId, totalTickets, token);
++		return recount.previous() == -2 ? Optional.empty() : Optional.of(recount);
++	}
++
++	@SuppressWarnings("unchecked")
++	private Recount runRecount(long eventId, int totalTickets, String token) {
++		List<Long> result = redis.execute(RECOUNT, List.of(stockKey(eventId), buyersKey(eventId), ordersKey(eventId),
++				rebuildKey(eventId), recoveringSinceKey(eventId), heldKey(eventId)), String.valueOf(totalTickets), token);
+ 		return new Recount(result.get(0), result.get(1), result.get(2) == 1L);
+ 	}
+ 
++	/** O(1): whether stock + held tickets no longer add up to the total, so a full recount is due (drift.lua). */
++	public boolean drifted(long eventId, int totalTickets) {
++		return Long.valueOf(1).equals(
++				redis.execute(DRIFT, List.of(stockKey(eventId), heldKey(eventId)), String.valueOf(totalTickets)));
++	}
++
+ 	/** Order ids currently holding tickets, by scanning the orders hash. */
+ 	public List<String> heldOrderIds(long eventId) {
+ 		List<String> held = new ArrayList<>();
+@@ -179,7 +262,7 @@ public class StockGateway {
+ 	/** Orders that have waited in the outbox longer than {@code minAge}, as orderId -> order JSON. */
+ 	@SuppressWarnings("unchecked")
+ 	public Map<String, String> dueForRepublish(long eventId, Duration minAge, int limit) {
+-		List<String> flat = redis.execute(DUE, List.of(outboxKey(eventId), ordersKey(eventId)),
++		List<String> flat = redis.execute(DUE, List.of(outboxKey(eventId), ordersKey(eventId), sentKey(eventId)),
+ 				String.valueOf(minAge.toMillis()), String.valueOf(limit));
+ 		Map<String, String> due = new LinkedHashMap<>();
+ 		for (int i = 0; i + 1 < flat.size(); i += 2) {
+@@ -193,21 +276,39 @@ public class StockGateway {
+ 		return size == null ? 0 : size;
+ 	}
+ 
+-	/**
+-	 * Lets one instance rebuild an event's Redis state; others back off until the
+-	 * lease expires. shortcut: a plain SET NX lease, not a fenced lock; fine because
+-	 * every rebuild step is idempotent and the last step is one atomic recount.
+-	 */
+-	public boolean tryLeaseRebuild(long eventId, Duration lease) {
+-		return Boolean.TRUE.equals(redis.opsForValue().setIfAbsent(rebuildKey(eventId), "1", lease));
++	/** The Redis server's run_id: a new one after every restart, and on a different server after failover. */
++	public String serverRunId() {
++		Properties info = redis.execute((RedisCallback<Properties>) connection -> connection.serverCommands().info("server"));
++		return info.getProperty("run_id");
+ 	}
+ 
+-	public void shortenRebuildLease(long eventId, Duration lease) {
+-		redis.expire(rebuildKey(eventId), lease);
++	/**
++	 * Deletes every event's Redis state, for when Redis can't be trusted to have
++	 * all of it (see {@link RedisRestartGuard}). Stock keys go first, so each
++	 * event stops taking reservations at once and is then rebuilt from MySQL.
++	 */
++	public int wipeAllEvents() {
++		return unlinkMatching("ticketrush:{event:*}:stock") + unlinkMatching("ticketrush:{event:*");
+ 	}
+ 
+-	public void endRebuild(long eventId) {
+-		redis.delete(rebuildKey(eventId));
++	private int unlinkMatching(String pattern) {
++		List<String> batch = new ArrayList<>();
++		int deleted = 0;
++		try (Cursor<String> keys = redis.scan(ScanOptions.scanOptions().match(pattern).count(1000).build())) {
++			while (keys.hasNext()) {
++				batch.add(keys.next());
++				if (batch.size() == 500) {
++					deleted += batch.size();
++					redis.unlink(batch);
++					batch.clear();
++				}
++			}
++		}
++		if (!batch.isEmpty()) {
++			deleted += batch.size();
++			redis.unlink(batch);
++		}
++		return deleted;
+ 	}
+ 
+ 	public void initialize(long eventId, int available) {
+@@ -235,7 +336,8 @@ public class StockGateway {
+ 	}
+ 
+ 	private static List<String> eventKeys(long eventId) {
+-		return List.of(stockKey(eventId), buyersKey(eventId), ordersKey(eventId), outboxKey(eventId));
++		return List.of(stockKey(eventId), buyersKey(eventId), ordersKey(eventId), outboxKey(eventId),
++				sentKey(eventId), heldKey(eventId));
+ 	}
+ 
+ 	static String stockKey(long eventId) {
+@@ -258,8 +360,20 @@ public class StockGateway {
+ 		return "ticketrush:{event:" + eventId + "}:outbox";
+ 	}
+ 
++	static String heldKey(long eventId) {
++		return "ticketrush:{event:" + eventId + "}:held";
++	}
++
++	static String sentKey(long eventId) {
++		return "ticketrush:{event:" + eventId + "}:sent";
++	}
++
+ 	static String rebuildKey(long eventId) {
+ 		return "ticketrush:{event:" + eventId + "}:rebuild";
+ 	}
+ 
++	static String recoveringSinceKey(long eventId) {
++		return "ticketrush:{event:" + eventId + "}:recovering-since";
++	}
++
+ }
+diff --git a/src/main/java/com/yitaihuang/ticketrush/reservation/StockReconciler.java b/src/main/java/com/yitaihuang/ticketrush/reservation/StockReconciler.java
+index 750d5ee..01622ca 100644
+--- a/src/main/java/com/yitaihuang/ticketrush/reservation/StockReconciler.java
++++ b/src/main/java/com/yitaihuang/ticketrush/reservation/StockReconciler.java
+@@ -32,10 +32,20 @@ import io.micrometer.core.instrument.MeterRegistry;
+  *
+  * Each run, per event on sale: a missing stock key triggers a rebuild; orders
+  * Redis still holds but MySQL has finished (cancelled, expired, rejected, e.g.
+- * after a crash right after the commit) are released; then stock and per-user
+- * counts are recounted from the held orders in one atomic script. Every step is
+- * either idempotent per order or atomic, so it runs safely during a sale, with
+- * the consumer paused, and on several instances at once.
++ * after a crash right after the commit) are released; then, if the O(1)
++ * stock-count invariant check {@code stock + held = total} fails, stock and
++ * per-user counts are recounted from the held orders in one atomic script. That
++ * check covers the two counters only, not the orders hash, per-user counts or
++ * agreement with MySQL: it is not an audit. Every step is either idempotent
++ * per order or atomic, so it runs safely during a sale, with the consumer
++ * paused, and on several instances at once.
++ *
++ * <p>The full recount is gated because it blocks Redis for its whole run
++ * (measured: ~3 ms per 2k held orders, ~34 ms per 20k, ~220 ms per 100k). The
++ * held-order scan above uses HSCAN, which doesn't block, and only proposes
++ * candidates: every release it triggers is idempotent and only for orders
++ * MySQL has finished, so an order added or released mid-scan is at worst
++ * picked up on the next run.
+  */
+ @Component
+ public class StockReconciler {
+@@ -81,6 +91,9 @@ public class StockReconciler {
+ 			return;
+ 		}
+ 		releaseFinishedOrders(eventId);
++		if (!stock.drifted(eventId, event.getTotalTickets())) {
++			return;
++		}
+ 		Recount recount = stock.recount(eventId, event.getTotalTickets());
+ 		if (recount.changed()) {
+ 			meters.counter("ticketrush.stock.corrections").increment();
+diff --git a/src/main/java/com/yitaihuang/ticketrush/reservation/StockRecovery.java b/src/main/java/com/yitaihuang/ticketrush/reservation/StockRecovery.java
+index 429163d..d407cb2 100644
+--- a/src/main/java/com/yitaihuang/ticketrush/reservation/StockRecovery.java
++++ b/src/main/java/com/yitaihuang/ticketrush/reservation/StockRecovery.java
+@@ -5,7 +5,9 @@ import java.time.Duration;
+ import java.time.Instant;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.Optional;
+ import java.util.OptionalLong;
++import java.util.UUID;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -30,10 +32,27 @@ import tools.jackson.databind.json.JsonMapper;
+  * second order.
+  *
+  * <p>While the event's stock key is missing, reservations for it are refused
+- * (503, retryable). The rebuild waits until the order topic is drained, because
+- * an order still in Kafka is in neither store: rebuilding before it lands would
+- * forget its idempotency key. Orders consumed during the rebuild are confirmed
+- * into the same hash, so none is lost either way.
++ * (503, retryable). The barrier before rebuilding has two parts:
++ * <ol>
++ * <li>a quiet period from the moment the loss was first noticed, longer than a
++ * send can stay in flight (max.block.ms + delivery.timeout.ms), so requests and
++ * relay batches that started before the loss, on any instance, have either
++ * reached Kafka or failed for good;</li>
++ * <li>then consumer lag 0, so everything that did reach Kafka is in MySQL.</li>
++ * </ol>
++ * After that MySQL knows every order whose send had reached the producer, but
++ * not one whose request paused before its send for longer than any timer. Such
++ * an order arrives after the rebuild, unknown to Redis while the stock key
++ * exists, and the consumer rejects it (see confirm.lua); that is sound because
++ * {@link RedisRestartGuard} turns every restart into a full loss, so Redis never
++ * runs on a partial old state. Orders only Redis knew are gone with Redis, and a
++ * retry with their idempotency key places a fresh order.
++ *
++ * <p>The rebuild runs under a lease identified by a random token, checked inside
++ * every seeding script and the final recount, so a rebuilder that stalled past
++ * its lease (or whose Redis was wiped again) can't write into a newer rebuild.
++ * A crashed rebuild leaves its lease to expire; the next one re-seeds, which is
++ * idempotent. Orders consumed meanwhile are claimed into the same hash.
+  */
+ @Component
+ public class StockRecovery {
+@@ -59,6 +78,8 @@ public class StockRecovery {
+ 
+ 	private final Duration idempotencyTtl;
+ 
++	private final Duration quietPeriod;
++
+ 	private final MeterRegistry meters;
+ 
+ 	private final Clock clock;
+@@ -71,47 +92,69 @@ public class StockRecovery {
+ 		this.queueLag = queueLag;
+ 		this.json = json;
+ 		this.idempotencyTtl = properties.reservations().idempotencyTtl();
++		this.quietPeriod = properties.reservations().recoveryQuietPeriod();
+ 		this.meters = meters;
+ 		this.clock = clock;
+ 	}
+ 
+-	/** Returns true once the event's Redis state exists again, false if it isn't safe to rebuild yet. */
++	/** Returns true once the event's Redis state exists again, false if it isn't safe (or this caller's turn) yet. */
+ 	public boolean rebuild(long eventId) {
+-		if (!stock.tryLeaseRebuild(eventId, LEASE)) {
+-			return false;
++		String token = UUID.randomUUID().toString();
++		switch (stock.beginRebuild(eventId, token, LEASE, quietPeriod)) {
++			case DONE:
++				return true;
++			case BUSY:
++			case WAIT:
++				return false;
++			case GO:
++				break;
+ 		}
+ 		OptionalLong lag = queueLag.current();
+ 		if (lag.isEmpty() || lag.getAsLong() > 0) {
+-			stock.shortenRebuildLease(eventId, RETRY_AFTER);
++			stock.releaseRebuildLease(eventId, token, RETRY_AFTER);
+ 			return false;
+ 		}
+ 		try {
+-			if (stock.available(eventId).isPresent()) {
+-				return true;
+-			}
+-			Event event = events.findById(eventId).orElseThrow();
+-			Instant now = clock.instant();
+-			List<SeedOrder> batch = new ArrayList<>(BATCH);
+-			int seeded = 0;
+-			for (Order order : orders.findByEventId(eventId)) {
+-				batch.add(seedOf(order, now));
+-				if (batch.size() == BATCH) {
+-					stock.seed(eventId, batch);
+-					seeded += batch.size();
+-					batch.clear();
++			return seedAndFinish(eventId, token);
++		}
++		catch (RuntimeException ex) {
++			stock.releaseRebuildLease(eventId, token, Duration.ZERO);
++			throw ex;
++		}
++	}
++
++	private boolean seedAndFinish(long eventId, String token) {
++		Event event = events.findById(eventId).orElseThrow();
++		Instant now = clock.instant();
++		List<SeedOrder> batch = new ArrayList<>(BATCH);
++		int seeded = 0;
++		for (Order order : orders.findByEventId(eventId)) {
++			batch.add(seedOf(order, now));
++			if (batch.size() == BATCH) {
++				if (!stock.seed(eventId, token, LEASE, batch)) {
++					return fencedOff(eventId);
+ 				}
++				seeded += batch.size();
++				batch.clear();
+ 			}
+-			stock.seed(eventId, batch);
+-			seeded += batch.size();
+-			Recount recount = stock.recount(eventId, event.getTotalTickets());
+-			meters.counter("ticketrush.stock.rebuilds").increment();
+-			log.warn("Rebuilt Redis state of event {} from {} MySQL orders: stock {}", eventId, seeded,
+-					recount.stock());
+-			return true;
+ 		}
+-		finally {
+-			stock.endRebuild(eventId);
++		if (!stock.seed(eventId, token, LEASE, batch)) {
++			return fencedOff(eventId);
+ 		}
++		seeded += batch.size();
++		Optional<Recount> recount = stock.finishRebuild(eventId, token, event.getTotalTickets());
++		if (recount.isEmpty()) {
++			return fencedOff(eventId);
++		}
++		meters.counter("ticketrush.stock.rebuilds").increment();
++		log.warn("Rebuilt Redis state of event {} from {} MySQL orders: stock {}", eventId, seeded,
++				recount.get().stock());
++		return true;
++	}
++
++	private boolean fencedOff(long eventId) {
++		log.warn("Rebuild of event {} lost its lease; leaving it to the current holder", eventId);
++		return false;
+ 	}
+ 
+ 	private SeedOrder seedOf(Order order, Instant now) {
+diff --git a/src/main/resources/application.yml b/src/main/resources/application.yml
+index 4da232c..7f105c5 100644
+--- a/src/main/resources/application.yml
++++ b/src/main/resources/application.yml
+@@ -10,6 +10,9 @@ spring:
+     password: ${MYSQL_PASSWORD:ticketrush}
+     hikari:
+       maximum-pool-size: 20
++      data-source-properties:
++        # Lets the driver send a JDBC batch of INSERTs as one multi-row statement.
++        rewriteBatchedStatements: true
+   jpa:
+     open-in-view: false
+     hibernate:
+@@ -18,6 +21,9 @@ spring:
+       hibernate:
+         jdbc:
+           time_zone: UTC
++          # The consumer writes a poll's orders in one transaction: one multi-row INSERT.
++          batch_size: 100
++        order_inserts: true
+         type:
+           preferred_instant_jdbc_type: TIMESTAMP
+   data:
+@@ -33,9 +39,16 @@ spring:
+         linger.ms: 5
+         # Fail fast (and know the order was never sent) when the brokers can't be reached at all.
+         max.block.ms: 1000
++        # Bound how long a send can still land after it started: the Redis recovery
++        # quiet period (ticketrush.reservations.recovery-quiet-period) relies on it.
++        request.timeout.ms: 4000
++        delivery.timeout.ms: 10000
+     consumer:
+       group-id: order-writer
+       auto-offset-reset: earliest
++      # One batch is one MySQL transaction holding the event's stock row: keep it short
++      # (~0.1 s), far inside max.poll.interval.ms (5 min) even when it is redone one by one.
++      max-poll-records: 200
+     listener:
+       concurrency: 3
+   cache:
+@@ -67,6 +80,7 @@ ticketrush:
+     republish-after: PT10S
+     max-unconfirmed-age: PT30S
+     relay-interval: PT2S
++    recovery-quiet-period: PT12S
+   rate-limit:
+     capacity: 10
+     refill-per-second: 5
+diff --git a/src/main/resources/redis/confirm.lua b/src/main/resources/redis/confirm.lua
+index f52b43d..d6f4323 100644
+--- a/src/main/resources/redis/confirm.lua
++++ b/src/main/resources/redis/confirm.lua
+@@ -1,30 +1,57 @@
+--- Called once MySQL holds an active order. Kafka has delivered it, so it leaves
+--- the outbox. If Redis has never seen the order (it lost its data while the
+--- order was in flight), the order is held now so Redis counts its tickets.
+--- A released order ('R') stays released.
++-- The consumer's claim, taken before it writes the order to MySQL. Atomic with
++-- release.lua, so an order is either released or claimed, never both:
++--   * released already ('R')  -> returns -1; the consumer must not give it tickets
++--   * held                     -> marks it sent (no not-sent release from now on),
++--                                 takes it out of the outbox, returns 0
++--   * unknown, first delivery, stock key present -> Redis lost the order and was
++--                                 rebuilt without it: its send came after the rebuild's
++--                                 barrier (a request that paused before its send), so
++--                                 its tickets and its user's limit may be someone
++--                                 else's now. Marks it released, returns -1. No clock is
++--                                 consulted: any Redis restart is turned into a full
++--                                 loss and a rebuild (RedisRestartGuard), so an unknown
++--                                 order here is always older than the current state.
++--   * unknown otherwise (a rebuild is still running, or MySQL already has the
++--                                 order) -> holds it now, restores its idempotency key,
++--                                 counts its tickets, returns 1
+ --
+ -- KEYS[1] stock counter
+ -- KEYS[2] buyers hash
+ -- KEYS[3] orders hash
+ -- KEYS[4] outbox
+--- KEYS[5] idempotency key of the order
++-- KEYS[5] sent set
++-- KEYS[6] held counter
++-- KEYS[7] idempotency key of the order
+ -- ARGV[1] orderId
+ -- ARGV[2] order JSON
+ -- ARGV[3] seconds left on the idempotency key (0 = don't restore it)
+---
+--- Returns 1 if the order was newly held, 0 if Redis already knew it.
++-- ARGV[4] 'new' if MySQL doesn't have the order yet, '' for a stored order's redelivery
+ 
++local current = redis.call('HGET', KEYS[3], ARGV[1])
++if current == 'R' then
++    return -1
++end
++if not current and ARGV[4] == 'new' and redis.call('EXISTS', KEYS[1]) == 1 then
++    redis.call('HSET', KEYS[3], ARGV[1], 'R')
++    redis.call('ZREM', KEYS[4], ARGV[1])
++    return -1
++end
++redis.call('SADD', KEYS[5], ARGV[1])
+ redis.call('ZREM', KEYS[4], ARGV[1])
+-if redis.call('HSETNX', KEYS[3], ARGV[1], ARGV[2]) == 0 then
++if current then
+     return 0
+ end
++
++redis.call('HSET', KEYS[3], ARGV[1], ARGV[2])
+ if tonumber(ARGV[3]) > 0 then
+-    redis.call('SET', KEYS[5], ARGV[1], 'NX', 'EX', tonumber(ARGV[3]))
++    redis.call('SET', KEYS[7], ARGV[1], 'NX', 'EX', tonumber(ARGV[3]))
+ end
++-- No stock key means a rebuild is running; its final recount counts this order.
+ if redis.call('EXISTS', KEYS[1]) == 1 then
+     local order = cjson.decode(ARGV[2])
+     -- May go below zero if Redis already resold these tickets; MySQL then rejects the extra order.
+     redis.call('DECRBY', KEYS[1], order.quantity)
++    redis.call('INCRBY', KEYS[6], order.quantity)
+     redis.call('HINCRBY', KEYS[2], order.userId, order.quantity)
+ end
+ return 1
+diff --git a/src/main/resources/redis/due.lua b/src/main/resources/redis/due.lua
+index a65ddc0..b389974 100644
+--- a/src/main/resources/redis/due.lua
++++ b/src/main/resources/redis/due.lua
+@@ -1,10 +1,12 @@
+ -- Orders that have sat in the outbox longer than ARGV[1] ms: Kafka may never
+ -- have stored them (an ack that timed out, a crash before the send). Returns
+--- {orderId, order JSON, ...} for the relay to publish again. Entries whose order
+--- was released meanwhile are dropped.
++-- {orderId, order JSON, ...} for the relay to publish again, and marks each one
++-- sent first, so the original request can no longer release it as not-sent
++-- once the relay may be sending it. Entries released meanwhile are dropped.
+ --
+ -- KEYS[1] outbox
+ -- KEYS[2] orders hash
++-- KEYS[3] sent set
+ -- ARGV[1] min age in ms
+ -- ARGV[2] max orders to return
+ local t = redis.call('TIME')
+@@ -14,6 +16,7 @@ local due = {}
+ for _, id in ipairs(ids) do
+     local order = redis.call('HGET', KEYS[2], id)
+     if order and order ~= 'R' then
++        redis.call('SADD', KEYS[3], id)
+         due[#due + 1] = id
+         due[#due + 1] = order
+     else
+diff --git a/src/main/resources/redis/recount.lua b/src/main/resources/redis/recount.lua
+index b80db51..7590acb 100644
+--- a/src/main/resources/redis/recount.lua
++++ b/src/main/resources/redis/recount.lua
+@@ -1,16 +1,33 @@
+ -- Recomputes stock and per-user counts from the held orders, in one atomic step:
+ --   stock = total - (tickets of held orders),  buyers[u] = tickets held by u
+ -- Nothing can interleave, so this is safe while a sale is running, and orders
+--- still in flight to MySQL are counted because they are held. Creates the stock
+--- key at the end of a rebuild; on a live event it only fixes drift (a hand edit,
+--- a bug), which it reports.
++-- still in flight to MySQL are counted because they are held.
++--
++-- Two modes. Live (ARGV[2] = ''): only fixes drift (a hand edit, a bug) and
++-- never creates a missing stock key, because a missing key means a rebuild is
++-- seeding and a count of a half-seeded hash would put tickets on sale twice.
++-- Finishing a rebuild (ARGV[2] = token): fenced by the lease, creates the stock
++-- key, and ends the recovery.
+ --
+ -- KEYS[1] stock counter
+ -- KEYS[2] buyers hash
+ -- KEYS[3] orders hash
++-- KEYS[4] rebuild lease
++-- KEYS[5] recovering-since
++-- KEYS[6] held counter (set to the recounted total)
+ -- ARGV[1] total tickets of the event
++-- ARGV[2] '' or the rebuild token
+ --
+--- Returns {previous stock or -1 if missing, new stock, 1 if per-user counts changed}
++-- Returns {previous stock or -1 if missing, new stock, 1 if per-user counts changed},
++-- {-1, -1, 0} if live and there is no stock key, {-2, -2, 0} if fenced off.
++
++if ARGV[2] == '' then
++    if redis.call('EXISTS', KEYS[1]) == 0 then
++        return {-1, -1, 0}
++    end
++elseif redis.call('GET', KEYS[4]) ~= ARGV[2] then
++    return {-2, -2, 0}
++end
+ 
+ local entries = redis.call('HGETALL', KEYS[3])
+ local held, perUser = 0, {}
+@@ -22,6 +39,7 @@ for i = 2, #entries, 2 do
+     end
+ end
+ 
++redis.call('SET', KEYS[6], held)
+ local expected = tonumber(ARGV[1]) - held
+ local previous = tonumber(redis.call('GET', KEYS[1]) or '-1')
+ if previous ~= expected then
+@@ -47,4 +65,7 @@ if buyersChanged == 1 or seen ~= 0 then
+         redis.call('HSET', KEYS[2], user, qty)
+     end
+ end
++if ARGV[2] ~= '' then
++    redis.call('DEL', KEYS[4], KEYS[5])
++end
+ return {previous, expected, buyersChanged}
+diff --git a/src/main/resources/redis/release.lua b/src/main/resources/redis/release.lua
+index 38785b2..67c71dc 100644
+--- a/src/main/resources/redis/release.lua
++++ b/src/main/resources/redis/release.lua
+@@ -1,24 +1,39 @@
+ -- Returns an order's tickets to the pool (expired, cancelled, rejected by MySQL,
+--- or never handed to Kafka). Keyed by order id, so it is idempotent: the first
+--- call flips the order to 'R' and every later call (a retry, the reconciler, a
+--- redelivered message) finds 'R' and changes nothing. The 'R' marker lives in
+--- the same hash as the event's other state and never expires on its own, so it
+--- can't lapse while a retry is still possible.
++-- voided after dead-lettering, or never handed to Kafka). Keyed by order id, so
++-- it is idempotent: the first call flips the order to 'R' and every later call
++-- (a retry, the reconciler, a redelivered message) finds 'R' and changes
++-- nothing. The 'R' marker lives in the same hash as the event's other state and
++-- never expires on its own, so it can't lapse while a retry is still possible.
++--
++-- In 'not-sent' mode (the request's own send failed before the record was
++-- queued) it refuses if the order is in the sent set: the relay or the consumer
++-- has already taken it, so a copy may exist in Kafka and releasing would let it
++-- become an order whose tickets are back on sale. The check and the release
++-- are one script, so nothing can slip in between.
+ --
+ -- KEYS[1] stock counter
+ -- KEYS[2] buyers hash
+ -- KEYS[3] orders hash
+ -- KEYS[4] outbox
+--- KEYS[5] (optional) idempotency key to forget, so the client can retry
++-- KEYS[5] sent set           ticketrush:{event:<id>}:sent    (orders that may exist in Kafka)
++-- KEYS[6] held counter
++-- KEYS[7] (optional) idempotency key to forget, so the client can retry
+ -- ARGV[1] orderId
++-- ARGV[2] 'not-sent' or ''
+ --
+--- Returns 1 if tickets were returned, 0 if there was nothing to release.
++-- Returns 1 if tickets were returned, 0 if there was nothing to release,
++-- -1 if a not-sent release was refused.
++
++if ARGV[2] == 'not-sent' and redis.call('SISMEMBER', KEYS[5], ARGV[1]) == 1 then
++    return -1
++end
+ 
+ local held = redis.call('HGET', KEYS[3], ARGV[1])
+ redis.call('HSET', KEYS[3], ARGV[1], 'R')
+ redis.call('ZREM', KEYS[4], ARGV[1])
+-if KEYS[5] and redis.call('GET', KEYS[5]) == ARGV[1] then
+-    redis.call('DEL', KEYS[5])
++redis.call('SREM', KEYS[5], ARGV[1])
++if KEYS[7] and redis.call('GET', KEYS[7]) == ARGV[1] then
++    redis.call('DEL', KEYS[7])
+ end
+ 
+ if not held or held == 'R' then
+@@ -31,6 +46,7 @@ end
+ 
+ local order = cjson.decode(held)
+ redis.call('INCRBY', KEYS[1], order.quantity)
++redis.call('DECRBY', KEYS[6], order.quantity)
+ local left = redis.call('HINCRBY', KEYS[2], order.userId, -order.quantity)
+ if left <= 0 then
+     redis.call('HDEL', KEYS[2], order.userId)
+diff --git a/src/main/resources/redis/reserve.lua b/src/main/resources/redis/reserve.lua
+index 199a15f..fdd963b 100644
+--- a/src/main/resources/redis/reserve.lua
++++ b/src/main/resources/redis/reserve.lua
+@@ -10,6 +10,7 @@
+ -- KEYS[3] idempotency key    ticketrush:{event:<id>}:idem:<userId>:<key>
+ -- KEYS[4] orders hash        ticketrush:{event:<id>}:orders   (orderId -> order JSON while held, 'R' once released)
+ -- KEYS[5] outbox             ticketrush:{event:<id>}:outbox   (orderId scored by accept time, until Kafka confirms)
++-- KEYS[6] held counter       ticketrush:{event:<id>}:held     (tickets of held orders; stock + held = total)
+ -- ARGV[1] userId
+ -- ARGV[2] quantity
+ -- ARGV[3] per-user limit
+@@ -49,6 +50,7 @@ if held + qty > tonumber(ARGV[3]) then
+ end
+ 
+ redis.call('DECRBY', KEYS[1], qty)
++redis.call('INCRBY', KEYS[6], qty)
+ redis.call('HINCRBY', KEYS[2], ARGV[1], qty)
+ redis.call('SET', KEYS[3], ARGV[4], 'EX', tonumber(ARGV[5]))
+ redis.call('HSET', KEYS[4], ARGV[4], ARGV[6])
+diff --git a/src/main/resources/redis/seed.lua b/src/main/resources/redis/seed.lua
+index 969cab9..8ba265a 100644
+--- a/src/main/resources/redis/seed.lua
++++ b/src/main/resources/redis/seed.lua
+@@ -1,16 +1,28 @@
+ -- Rebuild after Redis lost an event's data: puts orders known to MySQL back into
+ -- the orders hash and restores their idempotency keys. Entries already present
+--- win (HSETNX / SET NX), so an order confirmed or released during the rebuild
++-- win (HSETNX / SET NX), so an order claimed or released during the rebuild
+ -- keeps its newer state.
+ --
+--- KEYS[1]   orders hash
+--- KEYS[1+i] idempotency key of order i
+--- ARGV      per order: orderId, value (order JSON if active, 'R' otherwise), idempotency TTL in seconds
+-for i = 1, #KEYS - 1 do
+-    local id, value, ttl = ARGV[3 * i - 2], ARGV[3 * i - 1], tonumber(ARGV[3 * i])
+-    redis.call('HSETNX', KEYS[1], id, value)
++-- Fenced: runs only while KEYS[1] still holds this rebuilder's token (and renews
++-- it), so a rebuilder whose lease expired, or whose Redis was wiped again, can't
++-- write into someone else's rebuild.
++--
++-- KEYS[1]   rebuild lease
++-- KEYS[2]   orders hash
++-- KEYS[2+i] idempotency key of order i
++-- ARGV[1]   token, ARGV[2] lease in ms
++-- ARGV      then per order: orderId, value (order JSON if active, 'R' otherwise), idempotency TTL in seconds
++--
++-- Returns the number of orders seeded, or -1 if fenced off.
++if redis.call('GET', KEYS[1]) ~= ARGV[1] then
++    return -1
++end
++redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))
++for i = 1, #KEYS - 2 do
++    local id, value, ttl = ARGV[3 * i], ARGV[3 * i + 1], tonumber(ARGV[3 * i + 2])
++    redis.call('HSETNX', KEYS[2], id, value)
+     if ttl > 0 then
+-        redis.call('SET', KEYS[1 + i], id, 'NX', 'EX', ttl)
++        redis.call('SET', KEYS[2 + i], id, 'NX', 'EX', ttl)
+     end
+ end
+-return #KEYS - 1
++return #KEYS - 2
+diff --git a/src/test/java/com/yitaihuang/ticketrush/AbstractIntegrationTest.java b/src/test/java/com/yitaihuang/ticketrush/AbstractIntegrationTest.java
+index 45ae63c..d6c2b08 100644
+--- a/src/test/java/com/yitaihuang/ticketrush/AbstractIntegrationTest.java
++++ b/src/test/java/com/yitaihuang/ticketrush/AbstractIntegrationTest.java
+@@ -6,6 +6,7 @@ import java.time.temporal.ChronoUnit;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Objects;
+ import java.util.UUID;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.atomic.AtomicLong;
+@@ -20,6 +21,8 @@ import org.springframework.boot.test.context.SpringBootTest;
+ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+ import org.springframework.context.annotation.Import;
+ import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
++import org.springframework.kafka.listener.MessageListenerContainer;
+ import org.testcontainers.junit.jupiter.Testcontainers;
+ 
+ import com.yitaihuang.ticketrush.auth.Role;
+@@ -30,6 +33,7 @@ import com.yitaihuang.ticketrush.event.EventService;
+ import com.yitaihuang.ticketrush.order.Order;
+ import com.yitaihuang.ticketrush.order.OrderRepository;
+ import com.yitaihuang.ticketrush.order.OrderRequested;
++import com.yitaihuang.ticketrush.order.OrderStatus;
+ import com.yitaihuang.ticketrush.reservation.ReservationService;
+ 
+ import tools.jackson.databind.json.JsonMapper;
+@@ -42,7 +46,11 @@ import tools.jackson.databind.json.JsonMapper;
+ // Background jobs off: tests that need them call them directly, at a known moment.
+ // The relay resends anything unconfirmed when a test calls it, without waiting.
+ @SpringBootTest(properties = { "ticketrush.orders.expiry-scan-interval=PT1H", "ticketrush.reconciliation.interval=PT1H",
+-		"ticketrush.reservations.relay-interval=PT1H", "ticketrush.reservations.republish-after=PT0S" })
++		"ticketrush.reservations.relay-interval=PT1H", "ticketrush.reservations.republish-after=PT0S",
++		// Recovery waits until a test says the quiet period is over (quietPeriodOver).
++		"ticketrush.reservations.recovery-quiet-period=PT1H",
++		// The Redis restart check runs once at startup; tests that need it call it.
++		"ticketrush.reservations.redis-check-interval=PT1H" })
+ @AutoConfigureMockMvc
+ @Import(TestcontainersConfiguration.class)
+ @Testcontainers(disabledWithoutDocker = true)
+@@ -69,6 +77,9 @@ public abstract class AbstractIntegrationTest {
+ 	@Autowired
+ 	protected JsonMapper json;
+ 
++	@Autowired
++	private KafkaListenerEndpointRegistry listeners;
++
+ 	/** Test users by name, each with a stable numeric id: the JWT subject the API sees. */
+ 	private static final Map<String, Long> USER_IDS = new ConcurrentHashMap<>();
+ 
+@@ -103,6 +114,28 @@ public abstract class AbstractIntegrationTest {
+ 		return orderId;
+ 	}
+ 
++	/** Runs {@code body} with the order writer stopped, so accepted orders pile up in Kafka. */
++	protected void withConsumerStopped(Runnable body) {
++		MessageListenerContainer writer = listeners.getListenerContainer("order-writer");
++		writer.stop();
++		try {
++			body.run();
++		}
++		finally {
++			writer.start();
++		}
++	}
++
++	/** Redis lost everything it had about the event, as after a restart without persistence. */
++	protected void wipeRedis(long eventId) {
++		redis.delete(redis.keys("ticketrush:{event:" + eventId + "}:*"));
++	}
++
++	/** Pretends the loss was noticed long ago, so the recovery quiet period has passed. */
++	protected void quietPeriodOver(long eventId) {
++		redis.opsForValue().set("ticketrush:{event:" + eventId + "}:recovering-since", "0");
++	}
++
+ 	/** Waits until nothing is in flight and both stores tell the same story (see {@link #assertStoresAgree}). */
+ 	protected void awaitStoresAgree(long eventId) {
+ 		await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> assertStoresAgree(eventId));
+@@ -137,13 +170,18 @@ public abstract class AbstractIntegrationTest {
+ 			.forEach((user, count) -> buyers.put(user, Long.parseLong(count)));
+ 
+ 		assertThat(redis.opsForZSet().size(prefix + "outbox")).as("unconfirmed orders").isZero();
++		assertThat(redis.opsForSet().members(prefix + "sent")).as("orders marked sent are held")
++			.allSatisfy(orderId -> assertThat(held).containsKey(orderId));
+ 		assertThat(held).as("orders Redis holds vs active orders in MySQL").isEqualTo(active);
+ 		assertThat(redis.opsForValue().get(prefix + "stock")).as("Redis stock")
+ 			.isEqualTo(String.valueOf(total - sum(held)));
+ 		assertThat(buyers).as("per-user counts").isEqualTo(perUser);
++		assertThat(Integer.parseInt(Objects.requireNonNullElse(redis.opsForValue().get(prefix + "held"), "0")))
++			.as("held counter").isEqualTo(sum(held));
+ 		assertThat(eventRepository.findById(eventId).orElseThrow().getAvailableTickets()).as("MySQL stock")
+ 			.isEqualTo(total - sum(active));
+-		for (Order order : stored) {
++		// A rejected order never held tickets for the client; its key may have been forgotten for a retry.
++		for (Order order : stored.stream().filter(o -> o.getStatus() != OrderStatus.REJECTED).toList()) {
+ 			assertThat(redis.opsForValue().get(prefix + "idem:" + order.getUserId() + ":" + order.getIdempotencyKey()))
+ 				.as("idempotency key of %s", order.getId())
+ 				.isEqualTo(order.getId());
+diff --git a/src/test/java/com/yitaihuang/ticketrush/order/OrderLifecycleIntegrationTest.java b/src/test/java/com/yitaihuang/ticketrush/order/OrderLifecycleIntegrationTest.java
+index e2ace1b..5f5a884 100644
+--- a/src/test/java/com/yitaihuang/ticketrush/order/OrderLifecycleIntegrationTest.java
++++ b/src/test/java/com/yitaihuang/ticketrush/order/OrderLifecycleIntegrationTest.java
+@@ -64,6 +64,7 @@ class OrderLifecycleIntegrationTest extends AbstractIntegrationTest {
+ 	void redeliveredKafkaMessagesDoNotCreateDuplicateOrders() {
+ 		long eventId = createEvent(5, 4);
+ 		var request = new OrderRequested(UUID.randomUUID().toString(), eventId, "heidi", 1, 2500, "k", Instant.now());
++		stock.reserve(eventId, "heidi", 1, 4, "k", request.orderId(), json.writeValueAsString(request));
+ 
+ 		orderService.recordRequest(request);
+ 		orderService.recordRequest(request);
+diff --git a/src/test/java/com/yitaihuang/ticketrush/reservation/ConsistencyIntegrationTest.java b/src/test/java/com/yitaihuang/ticketrush/reservation/ConsistencyIntegrationTest.java
+index eb4d938..0afcf0e 100644
+--- a/src/test/java/com/yitaihuang/ticketrush/reservation/ConsistencyIntegrationTest.java
++++ b/src/test/java/com/yitaihuang/ticketrush/reservation/ConsistencyIntegrationTest.java
+@@ -14,15 +14,14 @@ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.dao.DataIntegrityViolationException;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.jdbc.core.JdbcTemplate;
+-import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
+ import org.springframework.kafka.core.KafkaTemplate;
+-import org.springframework.kafka.listener.MessageListenerContainer;
+ 
+ import com.yitaihuang.ticketrush.AbstractIntegrationTest;
+ import com.yitaihuang.ticketrush.common.ApiException;
+ import com.yitaihuang.ticketrush.config.TicketrushProperties;
+ import com.yitaihuang.ticketrush.event.EventCatalog;
+ import com.yitaihuang.ticketrush.order.OrderConsumer;
++import com.yitaihuang.ticketrush.order.OrderFailureService;
+ import com.yitaihuang.ticketrush.order.OrderRequested;
+ import com.yitaihuang.ticketrush.order.OrderService;
+ import com.yitaihuang.ticketrush.order.OrderStatus;
+@@ -50,9 +49,9 @@ class ConsistencyIntegrationTest extends AbstractIntegrationTest {
+ 
+ 	@Autowired OrderConsumer consumer;
+ 
+-	@Autowired OrderQueueLag lag;
++	@Autowired OrderFailureService failures;
+ 
+-	@Autowired KafkaListenerEndpointRegistry listeners;
++	@Autowired OrderQueueLag lag;
+ 
+ 	@Autowired KafkaTemplate<String, String> kafka;
+ 
+@@ -232,6 +231,16 @@ class ConsistencyIntegrationTest extends AbstractIntegrationTest {
+ 		assertThatThrownBy(() -> consumer.onOrderRequested(orphan))
+ 			.isInstanceOf(DataIntegrityViolationException.class);
+ 		assertThat(orders.findByEventId(eventId)).hasSize(1);
++
++		// Redis never reserved the clash, so its claim refused it: it took no tickets. It is
++		// dead-lettered all the same (its rejected row clashes too); voiding it changes no stock.
++		assertThat(stock.available(eventId)).hasValue(9);
++		failures.record(clash, "DataIntegrityViolationException", "test-clash@1");
++		failures.voidOrder(failures.list(null).stream()
++			.filter(f -> clash.equals(f.getPayload()))
++			.findFirst()
++			.orElseThrow()
++			.getId(), null);
+ 		assertStoresAgree(eventId);
+ 	}
+ 
+@@ -302,7 +311,8 @@ class ConsistencyIntegrationTest extends AbstractIntegrationTest {
+ 			carolsOrder[0] = reservations.reserve(eventId, carol, 1, "carol-1").orderId(); // still in Kafka
+ 			await().atMost(Duration.ofSeconds(15)).until(() -> lag.current().orElse(0) > 0);
+ 
+-			redis.delete(redis.keys("ticketrush:{event:" + eventId + "}:*")); // Redis restarted empty
++			wipeRedis(eventId); // Redis restarted empty
++			quietPeriodOver(eventId); // sends from before the loss are done; only the queue is left
+ 
+ 			// Carol's order is in neither store yet: rebuilding now would forget it, so intake waits.
+ 			assertThatThrownBy(() -> reservations.reserve(eventId, dave, 1, "dave-1"))
+@@ -338,14 +348,4 @@ class ConsistencyIntegrationTest extends AbstractIntegrationTest {
+ 				Clock.systemUTC());
+ 	}
+ 
+-	private void withConsumerStopped(Runnable body) {
+-		listeners.getListenerContainers().forEach(MessageListenerContainer::stop);
+-		try {
+-			body.run();
+-		}
+-		finally {
+-			listeners.getListenerContainers().forEach(MessageListenerContainer::start);
+-		}
+-	}
+-
+ }
+diff --git a/src/test/java/com/yitaihuang/ticketrush/reservation/OrderRequestPublisherTest.java b/src/test/java/com/yitaihuang/ticketrush/reservation/OrderRequestPublisherTest.java
+index b29b6b7..5478618 100644
+--- a/src/test/java/com/yitaihuang/ticketrush/reservation/OrderRequestPublisherTest.java
++++ b/src/test/java/com/yitaihuang/ticketrush/reservation/OrderRequestPublisherTest.java
+@@ -27,7 +27,7 @@ class OrderRequestPublisherTest {
+ 	OrderRequestPublisher publisher = new OrderRequestPublisher(kafka,
+ 			new TicketrushProperties(new Orders("orders", 1, Duration.ofMinutes(10), Duration.ofSeconds(15), 10),
+ 					new Reservations(Duration.ofHours(1), Duration.ofMillis(50), Duration.ofSeconds(10),
+-							Duration.ofSeconds(30), Duration.ofSeconds(2)),
++							Duration.ofSeconds(30), Duration.ofSeconds(2), Duration.ofSeconds(12)),
+ 					null, null, null));
+ 
+ 	private Delivery publish() {
+diff --git a/src/test/java/com/yitaihuang/ticketrush/reservation/ReservationServiceTest.java b/src/test/java/com/yitaihuang/ticketrush/reservation/ReservationServiceTest.java
+index 8a86ff8..34cd581 100644
+--- a/src/test/java/com/yitaihuang/ticketrush/reservation/ReservationServiceTest.java
++++ b/src/test/java/com/yitaihuang/ticketrush/reservation/ReservationServiceTest.java
+@@ -110,6 +110,7 @@ class ReservationServiceTest {
+ 	void ticketsAreReturnedWhenTheOrderDefinitelyWasNotSent() {
+ 		givenRedisAnswers(Outcome.RESERVED);
+ 		when(publisher.publish(anyLong(), anyString(), anyString())).thenReturn(Delivery.NOT_SENT);
++		when(stock.releaseAndForget(anyLong(), anyString(), anyString(), anyString())).thenReturn(true);
+ 
+ 		assertThatThrownBy(() -> service.reserve(1L, "alice", 2, "key-1")).isInstanceOf(ApiException.class)
+ 			.hasFieldOrPropertyWithValue("status", HttpStatus.SERVICE_UNAVAILABLE);
+@@ -117,6 +118,19 @@ class ReservationServiceTest {
+ 		verify(pendingOrders, never()).markProcessing(anyString(), anyString());
+ 	}
+ 
++	@Test
++	void aNotSentOrderTheRelayAlreadyTookIsAcceptedNotReleased() {
++		givenRedisAnswers(Outcome.RESERVED);
++		when(publisher.publish(anyLong(), anyString(), anyString())).thenReturn(Delivery.NOT_SENT);
++		when(stock.releaseAndForget(anyLong(), anyString(), anyString(), anyString())).thenReturn(false);
++
++		ReservationService.Result result = service.reserve(1L, "alice", 2, "key-1");
++
++		assertThat(result.replayed()).isFalse();
++		verify(pendingOrders).markProcessing(result.orderId(), "alice");
++		assertThat(meters.counter("ticketrush.reservations", "outcome", "unconfirmed").count()).isEqualTo(1);
++	}
++
+ 	@Test
+ 	void anUnconfirmedSendKeepsTheTicketsAndLeavesTheOrderToTheRelay() {
+ 		givenRedisAnswers(Outcome.RESERVED);
+diff --git a/src/test/java/com/yitaihuang/ticketrush/reservation/StockReconcilerTest.java b/src/test/java/com/yitaihuang/ticketrush/reservation/StockReconcilerTest.java
+index 300b1d3..277ced9 100644
+--- a/src/test/java/com/yitaihuang/ticketrush/reservation/StockReconcilerTest.java
++++ b/src/test/java/com/yitaihuang/ticketrush/reservation/StockReconcilerTest.java
+@@ -88,8 +88,18 @@ class StockReconcilerTest {
+ 		verify(stock, never()).release(anyLong(), anyString());
+ 	}
+ 
++	@Test
++	void withoutDriftTheExpensiveRecountIsSkipped() {
++		when(stock.drifted(1L, 10)).thenReturn(false);
++
++		reconciler.reconcile(event);
++
++		verify(stock, never()).recount(anyLong(), org.mockito.ArgumentMatchers.anyInt());
++	}
++
+ 	@Test
+ 	void stockIsRecountedFromHeldOrdersNotCopiedFromMysql() {
++		when(stock.drifted(1L, 10)).thenReturn(true);
+ 		when(stock.recount(1L, 10)).thenReturn(new Recount(5, 7, false));
+ 
+ 		reconciler.reconcile(event);
+@@ -101,6 +111,7 @@ class StockReconcilerTest {
+ 
+ 	@Test
+ 	void aRecountThatChangesNothingIsNotCounted() {
++		when(stock.drifted(1L, 10)).thenReturn(true);
+ 		reconciler.reconcile(event);
+ 
+ 		assertThat(meters.counter("ticketrush.stock.corrections").count()).isZero();
