@@ -15,7 +15,11 @@ reconstructed from the diff and the timestamps, and not fully verifiable.
 | `batched` | `scripts/consumer_bench.py` | the same + the batch consumer (the two `code.diff` files differ exactly by the batching change and the load test reading `ticketrush_orders_consumed_total`) | one transaction per poll, at most 200 messages |
 | `mixed-batch200` | `run.sh` + `scripts/mixed_load.py` | `code.diff` + reconstructed `untracked-sources.tar.gz`, taken right after the runs; the code changed again afterwards (the atomic restart check, default deny) | the same batch consumer |
 
-**Delivered code, verified snapshot.**
+**Delivered code, verified snapshot.** "Delivered" means the code delivered when
+this was measured, on 2026-10-28: commit `2e4a4ae` plus the working tree recorded
+in `delivered/env.txt`, before PR #1 was merged. It is **not** the current `main`;
+later changes (the fenced Redis restart wipe, the sale cutoff, after-sale
+processing, dead-lettered order status) were not benchmarked.
 
 | Label | Driver | Code | Runs |
 |---|---|---|---|
