@@ -8,13 +8,22 @@ ticket each at the same time. Afterwards it checks the invariants that matter:
   * every accepted order was persisted to MySQL by the Kafka consumer
   * the event shows 0 tickets left
 
+Every user has its own JWT. The script signs them itself with the app's HS256
+key, the way an identity provider would, so the run doesn't spend minutes on
+20,000 BCrypt sign-ups first. The key defaults to $JWT_SECRET, or to the
+development key the app falls back to when JWT_SECRET isn't set.
+
 Usage:
   python3 scripts/load_test.py --tickets 500 --users 5000 --concurrency 200
 """
 
 import argparse
+import base64
+import hashlib
+import hmac
 import http.client
 import json
+import os
 import statistics
 import sys
 import threading
@@ -26,6 +35,23 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 _local = threading.local()
+
+# Same fallback as application.yml: only for local runs and CI.
+DEV_JWT_SECRET = "46nTHWwbEfvhyRNt4EVzb0fs8bOHvuq7D2Wao7h9qn0="
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def make_token(secret_b64, subject, scope):
+    """An HS256 access token shaped like the ones /api/auth/login issues."""
+    now = int(time.time())
+    header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    claims = {"iss": "ticketrush", "sub": subject, "iat": now, "exp": now + 3600, "scope": scope}
+    payload = b64url(json.dumps(claims).encode())
+    signature = hmac.new(base64.b64decode(secret_b64), f"{header}.{payload}".encode(), hashlib.sha256).digest()
+    return f"Bearer {header}.{payload}.{b64url(signature)}"
 
 
 def connection(base):
@@ -54,7 +80,7 @@ def request(base, method, path, body=None, headers=None):
                 raise
 
 
-def create_event(base, tickets):
+def create_event(base, tickets, admin_token):
     now = datetime.now(timezone.utc)
     status, body = request(base, "POST", "/api/events", {
         "name": f"Load test {now:%H:%M:%S}",
@@ -64,7 +90,7 @@ def create_event(base, tickets):
         "totalTickets": tickets,
         "priceCents": 5000,
         "perUserLimit": 1,
-    })
+    }, {"Authorization": admin_token})
     if status != 201:
         sys.exit(f"Could not create event: {status} {body}")
     return body["id"]
@@ -73,7 +99,7 @@ def create_event(base, tickets):
 def reserve(base, event_id, user):
     started = time.perf_counter()
     status, body = request(base, "POST", f"/api/events/{event_id}/reservations", {"quantity": 1}, {
-        "X-User-Id": user,
+        "Authorization": user,
         "Idempotency-Key": str(uuid.uuid4()),
     })
     elapsed_ms = (time.perf_counter() - started) * 1000
@@ -94,7 +120,7 @@ def wait_for_orders(base, accepted, timeout_s=60):
     statuses = Counter()
     while pending and time.time() < deadline:
         for order_id, user in list(pending.items()):
-            status, body = request(base, "GET", f"/api/orders/{order_id}", headers={"X-User-Id": user})
+            status, body = request(base, "GET", f"/api/orders/{order_id}", headers={"Authorization": user})
             if status == 200 and body["status"] != "PROCESSING":
                 statuses[body["status"]] += 1
                 del pending[order_id]
@@ -109,13 +135,16 @@ def main():
     parser.add_argument("--tickets", type=int, default=500)
     parser.add_argument("--users", type=int, default=5000)
     parser.add_argument("--concurrency", type=int, default=200)
+    parser.add_argument("--jwt-secret", default=os.environ.get("JWT_SECRET", DEV_JWT_SECRET),
+                        help="base64 HS256 key the app verifies tokens with (default: $JWT_SECRET or the dev key)")
     args = parser.parse_args()
     base = urlparse(args.base_url)
 
-    event_id = create_event(base, args.tickets)
+    event_id = create_event(base, args.tickets, make_token(args.jwt_secret, "1", "user admin"))
     print(f"Event {event_id}: {args.tickets} tickets, {args.users} users, concurrency {args.concurrency}")
 
-    users = [f"user-{uuid.uuid4().hex[:12]}" for _ in range(args.users)]
+    # Tokens are signed before the race starts, so signing isn't part of the measured latency.
+    users = [make_token(args.jwt_secret, str(10_000_000 + i), "user") for i in range(args.users)]
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         results = list(pool.map(lambda u: reserve(base, event_id, u), users))
