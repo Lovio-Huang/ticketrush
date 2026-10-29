@@ -23,8 +23,14 @@ public record TicketrushProperties(Orders orders, Reservations reservations, Rat
 	/**
 	 * @param idempotencyTtl how long a client's Idempotency-Key is remembered
 	 * @param publishTimeout how long to wait for Kafka to acknowledge an order
+	 * @param republishAfter how long an accepted order may wait for a Kafka ack before the relay sends it again
+	 * @param maxUnconfirmedAge if an event's oldest unconfirmed order is older than this, new reservations for it
+	 * are refused until Kafka catches up
+	 * @param relayInterval how often the relay looks for unconfirmed orders
 	 */
-	public record Reservations(Duration idempotencyTtl, Duration publishTimeout) {
+	public record Reservations(Duration idempotencyTtl, Duration publishTimeout,
+			@DefaultValue("PT10S") Duration republishAfter, @DefaultValue("PT30S") Duration maxUnconfirmedAge,
+			@DefaultValue("PT2S") Duration relayInterval) {
 	}
 
 	/**
@@ -47,7 +53,7 @@ public record TicketrushProperties(Orders orders, Reservations reservations, Rat
 	}
 
 	/**
-	 * @param interval how often Redis stock is compared with MySQL
+	 * @param interval how often Redis is checked against MySQL
 	 */
 	public record Reconciliation(Duration interval) {
 	}

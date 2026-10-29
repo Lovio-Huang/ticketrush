@@ -36,6 +36,9 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    # AOF, fsync every second: a restart loses at most ~1 s of writes instead of
+    # everything. Never evict: losing an order's key would break the stock invariant.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:

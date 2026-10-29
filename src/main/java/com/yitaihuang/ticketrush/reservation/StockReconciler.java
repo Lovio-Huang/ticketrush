@@ -2,9 +2,6 @@ package com.yitaihuang.ticketrush.reservation;
 
 import java.time.Clock;
 import java.util.List;
-import java.util.Map;
-import java.util.OptionalLong;
-import java.util.concurrent.ConcurrentHashMap;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -13,54 +10,58 @@ import org.springframework.stereotype.Component;
 
 import com.yitaihuang.ticketrush.event.Event;
 import com.yitaihuang.ticketrush.event.EventRepository;
+import com.yitaihuang.ticketrush.order.Order;
+import com.yitaihuang.ticketrush.order.OrderRepository;
+import com.yitaihuang.ticketrush.reservation.StockGateway.Recount;
 
 import io.micrometer.core.instrument.MeterRegistry;
 
 /**
  * Self-healing for the Redis copy of the inventory.
  *
- * <p>Redis and MySQL can drift apart: the app may crash between committing an
- * expiry in MySQL and returning the tickets to Redis (Redis too low, tickets go
- * unsold), or someone may edit Redis by hand (Redis too high, MySQL rejects the
- * extra orders). This job puts MySQL's number back into Redis, but only when it
- * is sure the difference is real drift and not orders in flight:
+ * <p>MySQL's stock and Redis's stock legitimately differ by the orders in
+ * flight (reserved in Redis, not yet written by the consumer), so copying
+ * MySQL's number into Redis would put those tickets on sale twice. Instead the
+ * job relies on two invariants that every Redis script keeps:
  *
- * <ol>
- * <li>the Kafka order queue must be fully drained (consumer lag 0), and</li>
- * <li>the same mismatch must be seen on two consecutive runs with nothing having
- * changed in between, so a reservation that is mid-flight can't be mistaken
- * for drift.</li>
- * </ol>
+ * <ul>
+ * <li>{@code stock + tickets of held orders = total tickets}, and per-user
+ * counts equal the tickets each user holds;</li>
+ * <li>an order is released at most once, keyed by its id.</li>
+ * </ul>
  *
- * The fix itself is a compare-and-set, so it never overwrites a reservation
- * that slipped in after the check.
+ * Each run, per event on sale: a missing stock key triggers a rebuild; orders
+ * Redis still holds but MySQL has finished (cancelled, expired, rejected, e.g.
+ * after a crash right after the commit) are released; then stock and per-user
+ * counts are recounted from the held orders in one atomic script. Every step is
+ * either idempotent per order or atomic, so it runs safely during a sale, with
+ * the consumer paused, and on several instances at once.
  */
 @Component
 public class StockReconciler {
 
 	private static final Logger log = LoggerFactory.getLogger(StockReconciler.class);
 
-	record Observation(int redis, int database) {
-	}
+	private static final int BATCH = 500;
 
 	private final EventRepository events;
 
+	private final OrderRepository orders;
+
 	private final StockGateway stock;
 
-	private final OrderQueueLag queueLag;
+	private final StockRecovery recovery;
 
 	private final MeterRegistry meters;
 
 	private final Clock clock;
 
-	/** Mismatches seen on the previous run, by event id. */
-	private final Map<Long, Observation> suspected = new ConcurrentHashMap<>();
-
-	public StockReconciler(EventRepository events, StockGateway stock, OrderQueueLag queueLag, MeterRegistry meters,
-			Clock clock) {
+	public StockReconciler(EventRepository events, OrderRepository orders, StockGateway stock, StockRecovery recovery,
+			MeterRegistry meters, Clock clock) {
 		this.events = events;
+		this.orders = orders;
 		this.stock = stock;
-		this.queueLag = queueLag;
+		this.recovery = recovery;
 		this.meters = meters;
 		this.clock = clock;
 	}
@@ -68,38 +69,36 @@ public class StockReconciler {
 	@Scheduled(fixedDelayString = "${ticketrush.reconciliation.interval}",
 			initialDelayString = "${ticketrush.reconciliation.interval}")
 	public void run() {
-		OptionalLong lag = queueLag.current();
-		if (lag.isEmpty() || lag.getAsLong() > 0) {
-			suspected.clear();
-			return;
+		for (Event event : events.findOnSale(clock.instant())) {
+			reconcile(event);
 		}
-		List<Event> onSale = events.findOnSale(clock.instant());
-		List<Long> ids = onSale.stream().map(Event::getId).toList();
-		Map<Long, Integer> inRedis = stock.availableMany(ids);
-		for (Event event : onSale) {
-			check(event.getId(), event.getAvailableTickets(), inRedis.get(event.getId()));
-		}
-		suspected.keySet().retainAll(ids);
 	}
 
-	void check(long eventId, int inDatabase, Integer inRedis) {
-		if (inRedis == null) {
-			stock.initializeIfAbsent(eventId, inDatabase);
+	void reconcile(Event event) {
+		long eventId = event.getId();
+		if (stock.available(eventId).isEmpty()) {
+			recovery.rebuild(eventId);
 			return;
 		}
-		if (inRedis == inDatabase) {
-			suspected.remove(eventId);
-			return;
-		}
-		Observation now = new Observation(inRedis, inDatabase);
-		Observation before = suspected.put(eventId, now);
-		if (!now.equals(before)) {
-			return; // first sighting, or the numbers are still moving: look again next run
-		}
-		if (stock.compareAndSet(eventId, inRedis, inDatabase)) {
-			suspected.remove(eventId);
+		releaseFinishedOrders(eventId);
+		Recount recount = stock.recount(eventId, event.getTotalTickets());
+		if (recount.changed()) {
 			meters.counter("ticketrush.stock.corrections").increment();
-			log.warn("Corrected Redis stock for event {} from {} to {} to match MySQL", eventId, inRedis, inDatabase);
+			log.warn("Recounted Redis stock of event {} from {} to {} (per-user counts changed: {})", eventId,
+					recount.previous(), recount.stock(), recount.buyersChanged());
+		}
+	}
+
+	/** Releases orders Redis still holds although MySQL no longer gives them tickets. */
+	private void releaseFinishedOrders(long eventId) {
+		List<String> held = stock.heldOrderIds(eventId);
+		for (int from = 0; from < held.size(); from += BATCH) {
+			for (Order order : orders.findAllById(held.subList(from, Math.min(from + BATCH, held.size())))) {
+				if (!order.getStatus().holdsTickets() && stock.release(eventId, order.getId())) {
+					meters.counter("ticketrush.stock.late_releases").increment();
+					log.warn("Released order {} ({}) that Redis still held", order.getId(), order.getStatus());
+				}
+			}
 		}
 	}
 

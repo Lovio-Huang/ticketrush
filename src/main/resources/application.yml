@@ -31,6 +31,8 @@ spring:
       properties:
         enable.idempotence: true
         linger.ms: 5
+        # Fail fast (and know the order was never sent) when the brokers can't be reached at all.
+        max.block.ms: 1000
     consumer:
       group-id: order-writer
       auto-offset-reset: earliest
@@ -62,6 +64,9 @@ ticketrush:
   reservations:
     idempotency-ttl: PT24H
     publish-timeout: PT5S
+    republish-after: PT10S
+    max-unconfirmed-age: PT30S
+    relay-interval: PT2S
   rate-limit:
     capacity: 10
     refill-per-second: 5
