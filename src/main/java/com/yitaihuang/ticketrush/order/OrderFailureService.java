@@ -109,6 +109,23 @@ public class OrderFailureService {
 		deadLettered.increment();
 	}
 
+	/** A dead-lettered order as its customer may see it: what they asked for, and where it stands. */
+	public record CustomerView(OrderRequested request, Status status) {
+	}
+
+	/**
+	 * The failure record of {@code orderId}, only if its message is a readable
+	 * order of {@code userId}'s: an unreadable payload, or one whose owner can't be
+	 * established, is shown to no customer.
+	 */
+	@Transactional(readOnly = true)
+	public Optional<CustomerView> findForCustomer(String orderId, String userId) {
+		return failures.findByOrderId(orderId)
+			.flatMap(failure -> parse(failure.getPayload())
+				.filter(request -> request.orderId().equals(orderId) && request.userId().equals(userId))
+				.map(request -> new CustomerView(request, failure.getStatus())));
+	}
+
 	@Transactional(readOnly = true)
 	public List<OrderFailure> list(Status status) {
 		return status == null ? failures.findTop100ByOrderByIdDesc() : failures.findTop100ByStatusOrderByIdDesc(status);
