@@ -1,6 +1,7 @@
 package com.yitaihuang.ticketrush.reservation;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -89,7 +90,7 @@ public class StockGateway {
 
 	public enum Outcome {
 
-		RESERVED, DUPLICATE, SOLD_OUT, LIMIT_EXCEEDED, NOT_INITIALIZED, QUEUE_BACKLOGGED
+		RESERVED, DUPLICATE, SOLD_OUT, LIMIT_EXCEEDED, NOT_INITIALIZED, QUEUE_BACKLOGGED, SALE_ENDED
 
 	}
 
@@ -99,17 +100,25 @@ public class StockGateway {
 
 	/**
 	 * Reserves the tickets and records {@code orderJson} (the Kafka message) as a
-	 * held order in the outbox, all in one atomic script.
+	 * held order in the outbox, all in one atomic script. A new reservation at or
+	 * after {@code saleEndsAt} by Redis's clock is refused ({@link Outcome#SALE_ENDED});
+	 * a duplicate of one accepted before still returns its order.
 	 */
 	@SuppressWarnings("unchecked")
 	public Reservation reserve(long eventId, String userId, int quantity, int perUserLimit, String idempotencyKey,
-			String newOrderId, String orderJson) {
+			String newOrderId, String orderJson, Instant saleEndsAt) {
 		List<String> result = redis.execute(RESERVE,
 				List.of(stockKey(eventId), buyersKey(eventId), idempotencyKey(eventId, userId, idempotencyKey),
 						ordersKey(eventId), outboxKey(eventId), heldKey(eventId)),
 				userId, String.valueOf(quantity), String.valueOf(perUserLimit), newOrderId,
-				String.valueOf(idempotencyTtl.toSeconds()), orderJson, String.valueOf(maxUnconfirmedAge.toMillis()));
+				String.valueOf(idempotencyTtl.toSeconds()), orderJson, String.valueOf(maxUnconfirmedAge.toMillis()),
+				String.valueOf(saleEndsAt.toEpochMilli()));
 		return new Reservation(Outcome.valueOf(result.get(0)), result.get(1));
+	}
+
+	/** The order a request with this idempotency key was accepted as, while Redis still remembers it. */
+	public Optional<String> acceptedOrderId(long eventId, String userId, String idempotencyKey) {
+		return Optional.ofNullable(redis.opsForValue().get(idempotencyKey(eventId, userId, idempotencyKey)));
 	}
 
 	/**

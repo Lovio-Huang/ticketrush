@@ -177,7 +177,7 @@ class BatchConsumerIntegrationTest extends AbstractIntegrationTest {
 		String orderId = UUID.randomUUID().toString();
 		String message = json.writeValueAsString(
 				new OrderRequested(orderId, eventId, userId, quantity, quantity * 2500, "k1", Instant.now()));
-		stock.reserve(eventId, userId, quantity, 4, "k1", orderId, message);
+		stock.reserve(eventId, userId, quantity, 4, "k1", orderId, message, SALE_OPEN);
 		return message;
 	}
 
