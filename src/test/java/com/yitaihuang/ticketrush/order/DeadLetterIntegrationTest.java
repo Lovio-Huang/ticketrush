@@ -306,7 +306,7 @@ class DeadLetterIntegrationTest extends AbstractIntegrationTest {
 	private String reserveInRedis(long eventId, String orderId, String user, int quantity) {
 		String message = json.writeValueAsString(
 				new OrderRequested(orderId, eventId, user, quantity, quantity * 2500, "k1", Instant.now()));
-		stock.reserve(eventId, user, quantity, 4, "k1", orderId, message);
+		stock.reserve(eventId, user, quantity, 4, "k1", orderId, message, SALE_OPEN);
 		return message;
 	}
 

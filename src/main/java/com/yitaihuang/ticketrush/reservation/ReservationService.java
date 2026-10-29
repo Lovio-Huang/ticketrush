@@ -2,6 +2,7 @@ package com.yitaihuang.ticketrush.reservation;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.Optional;
 import java.util.UUID;
 
 import org.slf4j.Logger;
@@ -81,6 +82,15 @@ public class ReservationService {
 					ApiException.conflict("SALE_NOT_STARTED", "Ticket sales open at " + event.saleStartsAt()));
 		}
 
+		if (!now.isBefore(event.startsAt())) {
+			// The sale ends when the event starts. A retry of a request accepted before still gets its order.
+			Optional<String> accepted = stock.acceptedOrderId(eventId, userId, idempotencyKey);
+			if (accepted.isPresent()) {
+				return duplicate(accepted.get(), userId);
+			}
+			throw saleEnded();
+		}
+
 		int amountCents;
 		try {
 			// Prices are capped so this fits; an event stored before the cap may not.
@@ -97,20 +107,15 @@ public class ReservationService {
 		String orderJson = json.writeValueAsString(new OrderRequested(orderId, eventId, userId, quantity,
 				amountCents, idempotencyKey, now));
 		Reservation reservation = stock.reserve(eventId, userId, quantity, event.perUserLimit(), idempotencyKey,
-				orderId, orderJson);
+				orderId, orderJson, event.startsAt());
 		if (reservation.outcome() == StockGateway.Outcome.NOT_INITIALIZED && recovery.rebuild(eventId)) {
 			reservation = stock.reserve(eventId, userId, quantity, event.perUserLimit(), idempotencyKey, orderId,
-					orderJson);
+					orderJson, event.startsAt());
 		}
 
 		return switch (reservation.outcome()) {
 			case RESERVED -> handOff(eventId, userId, idempotencyKey, orderId, orderJson);
-			case DUPLICATE -> {
-				// The original may still be on its way to Kafka (its reply was lost); polling shows it as processing.
-				pendingOrders.markProcessing(reservation.orderId(), userId);
-				count("duplicate");
-				yield new Result(reservation.orderId(), true);
-			}
+			case DUPLICATE -> duplicate(reservation.orderId(), userId);
 			case SOLD_OUT -> throw rejected("sold_out", ApiException.conflict("SOLD_OUT", "No tickets left"));
 			case LIMIT_EXCEEDED -> throw rejected("limit_exceeded", ApiException.conflict("PURCHASE_LIMIT_EXCEEDED",
 					"At most " + event.perUserLimit() + " tickets per customer"));
@@ -118,7 +123,20 @@ public class ReservationService {
 				.serviceUnavailable("ORDER_QUEUE_UNAVAILABLE", "Orders are not being confirmed right now, retry"));
 			case NOT_INITIALIZED -> throw rejected("stock_recovering", ApiException
 				.serviceUnavailable("STOCK_RECOVERING", "Ticket inventory is being restored, retry shortly"));
+			// Passed the check above, then reached Redis after the start (a pause, or clock skew).
+			case SALE_ENDED -> throw saleEnded();
 		};
+	}
+
+	private Result duplicate(String orderId, String userId) {
+		// The original may still be on its way to Kafka (its reply was lost); polling shows it as processing.
+		pendingOrders.markProcessing(orderId, userId);
+		count("duplicate");
+		return new Result(orderId, true);
+	}
+
+	private ApiException saleEnded() {
+		return rejected("sale_ended", ApiException.conflict("SALE_ENDED", "Ticket sales closed when the event started"));
 	}
 
 	private Result handOff(long eventId, String userId, String idempotencyKey, String orderId, String orderJson) {
