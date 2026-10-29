@@ -99,11 +99,27 @@ public class SecurityConfig {
 
 	@Bean
 	SecretKey jwtSigningKey(TicketrushProperties properties) {
-		String secret = properties.security().jwtSecret();
-		if (DEV_SECRET.equals(secret)) {
+		return signingKey(properties.security().jwtSecret());
+	}
+
+	/**
+	 * The HS256 key from JWT_SECRET. Unset or empty (Compose passes an unset
+	 * variable as "") means the development key, with a warning; anything else
+	 * must be valid base64 of at least 32 bytes, or the app refuses to start.
+	 * The secret itself never appears in a message.
+	 */
+	static SecretKey signingKey(String secret) {
+		if (secret == null || secret.isBlank() || DEV_SECRET.equals(secret)) {
 			log.warn("Using the built-in development JWT secret. Set JWT_SECRET before deploying anywhere real.");
+			secret = DEV_SECRET;
 		}
-		byte[] bytes = Base64.getDecoder().decode(secret);
+		byte[] bytes;
+		try {
+			bytes = Base64.getDecoder().decode(secret.strip());
+		}
+		catch (IllegalArgumentException ex) {
+			throw new IllegalStateException("JWT_SECRET is not valid base64; generate one with: openssl rand -base64 32");
+		}
 		if (bytes.length < 32) {
 			throw new IllegalStateException("JWT secret must be at least 256 bits (32 bytes, base64-encoded)");
 		}
