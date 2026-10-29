@@ -82,6 +82,10 @@ A reservation never waits on MySQL:
 4. **Persist.** A consumer writes the order to MySQL with a conditional `UPDATE ... WHERE available_tickets >= ?`, then confirms it in Redis. MySQL is the source of truth for orders; Redis is the fast, self-consistent copy the hot path reads.
 5. **Pay or expire.** The order waits 10 minutes for payment. After that, a scheduled job expires it and puts the tickets back on sale in both stores. Releases are keyed by order id, so they happen at most once.
 
+**The sale ends when the event starts.** A new reservation at or after `startsAt` gets `409 SALE_ENDED`. The app checks its own clock before Redis, and the reserve script checks again with Redis's clock (`TIME`) in the same atomic step that would create the order, after the idempotency check. So a request that passed the first check and then paused past the start is refused too, a retry of a request accepted before the start still gets its original order without reserving or publishing anything, and no order can enter the outbox after the start by Redis's clock. The boundary is exact per clock, not across clocks: with app hosts and Redis skewed, a request near the start is decided by whichever check runs on the later-reading clock. After a Redis loss, a retry after the start whose idempotency key Redis no longer has gets `SALE_ENDED`, like a new request (the order itself, if it reached MySQL, is unaffected).
+
+**Accepted orders keep being processed after the start.** The outbox relay and the reconciler don't work only on events on sale: they visit every event whose sale has begun and that isn't *settled* yet. An event is settled (`events.settled_at`) by a reconciler run at least an hour after its start (`ticketrush.reconciliation.settle-after`, past the payment window and any clock skew) that found nothing to fix and an empty outbox; no order can join the outbox after the start, by Redis's clock. Everything else that may still need the jobs is a MySQL write, and each one reopens the event in the same transaction: a stock change (an order stored, cancelled or expired), a rejected order, a recorded dead letter, a void. The settle is a compare-and-set on a version (`events.upkeep_version`) read before the checks, so a write that lands while the reconciler is checking keeps the event in, whichever instance settles it. So an order accepted just before the start is still resent and stored, and a cancellation or expiry after the start is still released in Redis, while past events don't pile up in every run. After the V4 migration every event whose sale has begun is visited once (and rebuilt in Redis if its state is gone) before it settles. Orders that existed only in Redis when Redis lost its data are still lost (see below).
+
 ## Design decisions
 
 | Problem | Approach | Trade-off / why |
@@ -115,9 +119,9 @@ Interactive docs: [`/swagger-ui.html`](http://localhost:8080/swagger-ui.html). A
 | `GET` | `/api/events/{id}/stats` | admin | Tickets sold, revenue, totals per order status, and whether Redis and MySQL agree |
 | `GET` | `/api/admin/order-failures` | admin | Dead-lettered order messages, newest first (100). `?status=OPEN` |
 | `POST` | `/api/admin/order-failures/{id}/replay` · `/void` · `/discard` | admin | Resolve one (see [Dead-lettered orders](#dead-lettered-orders)). Optional body `{"note": "..."}` |
-| `POST` | `/api/events/{id}/reservations` | user | Reserve tickets. Header `Idempotency-Key`. Returns `202` |
+| `POST` | `/api/events/{id}/reservations` | user | Reserve tickets. Header `Idempotency-Key`. Returns `202`. From `saleStartsAt` until the event's `startsAt`; after that `409 SALE_ENDED`, except a retry of an accepted request (same user and key), which gets its order back |
 | `GET` | `/api/orders` | user | My orders, newest first. `?status=PAID&page=0&size=20` |
-| `GET` | `/api/orders/{id}` | user | Order status: `PROCESSING` → `PENDING_PAYMENT` → `PAID` / `EXPIRED` / `CANCELLED` |
+| `GET` | `/api/orders/{id}` | user | Order status: `PROCESSING` → `PENDING_PAYMENT` → `PAID` / `EXPIRED` / `CANCELLED`; `UNDER_REVIEW` if it was dead-lettered and waits for an operator (tickets held), `REJECTED` if given up. Someone else's order is `404` |
 | `POST` | `/api/orders/{id}/payment` | user | Simulated payment |
 | `POST` | `/api/orders/{id}/cancellation` | user | Cancel and release the tickets |
 | `GET` | `/actuator/prometheus` | anyone | Metrics, including `ticketrush_reservations_total{outcome=...}` |
@@ -166,15 +170,16 @@ Each event's Redis state: `stock`, `held`, `buyers` (user → tickets), `idem:<u
 
 ### What a 202 means
 
-Three different things, which survive different failures:
+Four different things, which survive different failures:
 
 | State | How the client tells | Survives | Can still end as |
 |---|---|---|---|
 | **Accepted in Redis only** (an ack that never came back, or a not-sent release the relay pre-empted) | `202`, then `PROCESSING` | An app crash: the relay resends it within ~10 s. **Not** a Redis restart or loss: the order is gone, `GET /api/orders/{id}` returns `404`, and a retry with the same `Idempotency-Key` places a fresh order. | lost |
 | **Acknowledged by Kafka** (the normal path) | `202`, then `PROCESSING` | Any app or Redis failure: it is in Kafka (`acks=all`) and reaches MySQL. | `REJECTED`, if MySQL has no stock left for it, if its message reached Kafka only after a Redis rebuild, or reached the consumer while a Redis that came back with older data had not been caught yet (both below), or if it was dead-lettered and then voided, or replayed after a rebuild |
 | **An order** | `GET` shows `PENDING_PAYMENT`, then `PAID` | It is a MySQL row. | `EXPIRED` or `CANCELLED` (tickets go back on sale) |
+| **Dead-lettered** (the consumer gave up on it, see below) | `GET` shows `UNDER_REVIEW`: its failure record is in MySQL, so this lasts beyond the 10-minute `PROCESSING` marker. Only for its owner, and only if the message is a readable order; nothing of the error, the payload or the operator's notes is shown | It is a MySQL row (`order_failures`), tickets held | `PROCESSING` after a replay, then the stored order; `REJECTED` after a void |
 
-Only the last one is a sale. The first kind is what the outbox trades for keeping MySQL off the hot path; a MySQL outbox would remove it at the cost of a database write per reservation.
+Only an order is a sale. The first kind is what the outbox trades for keeping MySQL off the hot path; a MySQL outbox would remove it at the cost of a database write per reservation.
 
 ### Redis recovery
 
