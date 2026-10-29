@@ -6,15 +6,15 @@
 
 A ticketing backend built for **flash sales**: thousands of people hit "buy" the
 second tickets go on sale, and the system has to sell **exactly** the tickets it
-has. MySQL never sells a ticket twice, every order Kafka acknowledged is
-persisted, and response times stay flat; the cases that fall outside that are
-spelled out under [Consistency and recovery](#consistency-and-recovery).
+has. MySQL never sells a ticket twice and every order Kafka acknowledged is
+persisted; the cases that fall outside that are spelled out under
+[Consistency and recovery](#consistency-and-recovery).
 
 **Stack:** Java 21 (virtual threads) · Spring Boot 4 · Spring Security (JWT) · MySQL 8.4 · Redis (Lua scripts) · Kafka 4 (KRaft) · Flyway · Testcontainers · Docker Compose · GitHub Actions · Micrometer/Prometheus
 
 ## Results
 
-[`scripts/load_test.py`](scripts/load_test.py) against the Docker Compose stack, driven by [`scripts/consumer_bench.py`](scripts/consumer_bench.py): 20,000 signed-in users (each request carries a JWT the app verifies), 200 in flight at a time, one ticket each. Two scenarios: a **sell-out** (2,000 tickets) and **enough for everyone** (20,000 tickets, so every request becomes an order). Medians of 5 runs per scenario, ranges in brackets. These are the historical A/B runs. Their code snapshot was **reconstructed afterwards** from the saved diff and file timestamps and can't be fully verified (see [`perf/results`](perf/results/README.md)); the code has changed since (the claim script, the Redis restart guard). One round on the delivered code, with a source snapshot hashed before the build and checked after it, is listed separately there (`perf/results/delivered`: consumer 2,191 messages/s, drain 7.0 s, 202 → visible p99 6.9 s with enough for everyone). It is one sample: it shows the delivered build in the same range as the `batched` runs, and does not re-establish the speed-up.
+[`scripts/load_test.py`](scripts/load_test.py) against the Docker Compose stack, driven by [`scripts/consumer_bench.py`](scripts/consumer_bench.py): 20,000 signed-in users (each request carries a JWT the app verifies), 200 in flight at a time, one ticket each. Two scenarios: a **sell-out** (2,000 tickets) and **enough for everyone** (20,000 tickets, so every request becomes an order). Medians of 5 runs per scenario, ranges in brackets. These are the historical A/B runs. Their code snapshot was **reconstructed afterwards** from the saved diff and file timestamps and can't be fully verified (see [`perf/results`](perf/results/README.md)). One later round, with a source snapshot hashed before the build and checked after it, is listed separately there (`perf/results/delivered`: consumer 2,191 messages/s, drain 7.0 s, 202 → visible p99 6.9 s with enough for everyone). It is one sample: it shows that build in the same range as the `batched` runs, and does not re-establish the speed-up. "Delivered" names the code delivered *at that time* (commit `2e4a4ae` plus the working tree recorded in its `env.txt`, before PR #1 was merged), **not the current `main`**: everything since (the claim script, the Redis restart guard and its fenced wipe, the sale cutoff, after-sale processing) has not been benchmarked. What CI checks on every push is correctness under load, not speed.
 
 | | Sell-out: 2,000 tickets | Enough for everyone: 20,000 tickets |
 |---|---|---|
@@ -26,7 +26,7 @@ spelled out under [Consistency and recovery](#consistency-and-recovery).
 | 202 → `GET /orders/{id}` shows the order (sampled) | p50 2.0 s · p95 2.2 s · p99 2.2 s | p50 4.2 s · p95 6.3 s · p99 6.4 s |
 | Correctness, every run | exactly 2,000 sold, 2,000 persisted, stores agree | 20,000 sold and persisted, stores agree |
 
-The HTTP side answers at ~8–9k requests/s with flat latency. The order writer is the slower half: all orders for one event share one Kafka partition and one consumer thread. When nearly every request succeeds, the backlog is the whole burst, and an order shows `PROCESSING` for up to ~6 s.
+In these runs the HTTP side answered ~8–9k requests/s, with 202 answers at p99 ≤ 60 ms. The order writer was the slower half: all orders for one event share one Kafka partition and one consumer thread. When nearly every request succeeded, the backlog was the whole burst, and an order showed `PROCESSING` for up to ~6 s.
 
 ### Consumer batching, before and after
 
@@ -52,7 +52,8 @@ Older measurements, for context: the outbox and recovery work cost a median 4–
 > 10 CPUs and 8 GB for the VM, running the app, MySQL, Redis (AOF on at the time; compose now runs it without persistence), Kafka *and* the load
 > generator together. The script also polls order status, the stats endpoint and consumer lag
 > while it runs, which costs some throughput (the earlier, simpler script saw ~10k requests/s).
-> Treat these as a single-machine lower bound, not a production benchmark. CI runs a smaller
+> These are observations for this machine, this load and these few runs, not a production
+> benchmark, and they don't bound what another setup would do, up or down. CI runs a smaller
 > version of both scenarios on every push and fails on a single oversold or lost order.
 
 ## Architecture
@@ -305,11 +306,11 @@ python3 scripts/load_test.py --tickets 500 --users 5000 --concurrency 200
 
 | Layer | What it proves |
 |---|---|
-| Unit tests (`OrderTest`, `ReservationServiceTest`, `OrderRequestPublisherTest`, `StockReconcilerTest`) | The order state machine; "not sent" vs "maybe stored" Kafka results and what each does to the tickets; duplicates aren't republished; a missing Redis state is rebuilt or refused; the reconciler only releases orders MySQL has finished and never copies MySQL's stock |
+| Unit tests (`OrderTest`, `ReservationServiceTest`, `OrderRequestPublisherTest`, `StockReconcilerTest`, `SecurityConfigTest`) | The order state machine; "not sent" vs "maybe stored" Kafka results and what each does to the tickets; duplicates aren't republished; a missing Redis state is rebuilt or refused; the reconciler only releases orders MySQL has finished and never copies MySQL's stock |
 | Integration tests (Testcontainers: real MySQL, Redis and Kafka) | **1,000 concurrent buyers for 100 tickets sell exactly 100**; the reconciler running non-stop during a sale with cancellations never sells a ticket twice; every failure window above, including the relay racing a not-sent release, a rebuild with an old sender still running, an order that reaches Kafka only after the rebuild (whatever its sender's clock says), a Redis that came back with older data, 8 instances recovering at once, a rebuild that crashed halfway, replaying, voiding and redelivering dead-lettered orders, a void racing the consumer of a replayed copy, and the batch consumer's duplicates, rollbacks, poison messages and overlapping batches during a rebalance; per-user limits hold under parallel requests; idempotent replays; expiry and cancellation restore stock in both stores; MySQL catches Redis drift; forged, expired and foreign-issuer tokens are rejected; login guessing is throttled; non-admins can't create events or read stats; order history paging and filters |
 | CI load test (Docker Compose) | The real containerized stack sells exactly N tickets under load, and persists every order when there is enough for everyone |
 
-101 tests in all. The integration tests skip themselves on machines without Docker. CI always runs them.
+130 tests in all (`./mvnw clean verify`, also in CI). The integration tests skip themselves on machines without Docker. CI always runs them.
 
 ## Project layout
 
@@ -341,7 +342,7 @@ perf/              compare.py; results/: raw benchmark runs
 - **One stuck order pauses its event.** An order Kafka won't confirm for 30 s stops new reservations for that event. That's deliberate (it bounds how much only Redis knows), but there's no automatic give-up.
 - **Every Redis restart costs a rebuild.** Any restart, failover or restored snapshot means `503 STOCK_RECOVERING` for every event for at least the 12 s quiet period, and the Redis-only orders are lost. Orders whose message reaches Kafka only after the rebuild are rejected, even if there was stock.
 - **Failover is detected, not seamless.** If a running app's Redis is replaced by one with older data, per-user limits and idempotency are not guaranteed for up to ~1 s per instance, until its check runs (see [Redis recovery](#redis-recovery)). Closing that window would need the server check inside every reservation script.
-- **A Redis outage dead-letters orders.** The consumer must claim each order in Redis before writing it, so while Redis is unreachable every message fails, is retried 3 times and is dead-lettered. That is a retained message, not an order: the client's `GET` shows `PROCESSING` until someone replays it (see [Dead-lettered orders](#dead-lettered-orders) for what is kept).
+- **A Redis outage dead-letters orders.** The consumer must claim each order in Redis before writing it, so while Redis is unreachable every message fails, is retried 3 times and is dead-lettered. That is a retained message, not an order: the client's `GET` shows `PROCESSING` until the dead letter is recorded, then `UNDER_REVIEW` until someone replays it (`PROCESSING` again, then the stored order) or voids it (`REJECTED`); see [Dead-lettered orders](#dead-lettered-orders) for what is kept.
 - **The full recount blocks Redis.** Measured on Redis 7.4 on the laptop: ~3 ms for 2,000 held orders, ~34 ms for 20,000 (~46 ms with another 80,000 released markers), ~220 ms for 100,000, ~520 ms for 200,000; while it ran back to back, max GET latency went from ~1 ms to 100–240 ms. It now runs only when the O(1) stock-count invariant check (`stock + held = total`) fails, or once at the end of a rebuild, so normal operation never pays for it. That check does not catch drift in per-user counts alone, a hand-edited orders hash, or Redis and MySQL disagreeing about which orders exist; finding those takes the [audit](#auditing-and-manual-repair), which nothing runs automatically. Events beyond ~100,000 held orders would want the hash sharded before a drift ever forces a recount.
 - **Redis memory grows with orders.** Released orders stay in the hash as `R` markers (that is what makes releases idempotent) and held ones in the `sent` set, for the life of the event's keys.
 - **Per-address limits behind a proxy.** The sign-up and login limits key on the connecting address. Behind a load balancer every client shares one address, so the app would need to trust `X-Forwarded-For` from that proxy (`server.forward-headers-strategy`).
