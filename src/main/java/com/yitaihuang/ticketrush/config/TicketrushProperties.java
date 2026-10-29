@@ -3,9 +3,11 @@ package com.yitaihuang.ticketrush.config;
 import java.time.Duration;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.DefaultValue;
 
 @ConfigurationProperties("ticketrush")
-public record TicketrushProperties(Orders orders, Reservations reservations, RateLimit rateLimit) {
+public record TicketrushProperties(Orders orders, Reservations reservations, RateLimit rateLimit, Security security,
+		Reconciliation reconciliation) {
 
 	/**
 	 * @param topic Kafka topic that carries accepted reservations to the order writer
@@ -30,6 +32,24 @@ public record TicketrushProperties(Orders orders, Reservations reservations, Rat
 	 * @param refillPerSecond sustained requests per second per user
 	 */
 	public record RateLimit(int capacity, double refillPerSecond) {
+	}
+
+	/**
+	 * @param jwtSecret base64-encoded HS256 key, at least 32 bytes
+	 * @param tokenTtl lifetime of an access token
+	 * @param adminUsername admin account created at startup if it doesn't exist (optional)
+	 * @param adminPassword password for that admin account (optional)
+	 * @param loginAttemptsPerMinute login attempts allowed per account per minute (password guessing)
+	 * @param authRequestsPerMinutePerAddress logins and sign-ups allowed per client address per minute
+	 */
+	public record Security(String jwtSecret, Duration tokenTtl, String adminUsername, String adminPassword,
+			@DefaultValue("5") int loginAttemptsPerMinute, @DefaultValue("30") int authRequestsPerMinutePerAddress) {
+	}
+
+	/**
+	 * @param interval how often Redis stock is compared with MySQL
+	 */
+	public record Reconciliation(Duration interval) {
 	}
 
 }
