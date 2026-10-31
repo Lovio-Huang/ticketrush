@@ -3,12 +3,18 @@ package com.yitaihuang.ticketrush.reservation;
 import java.time.Duration;
 import java.util.OptionalInt;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import io.micrometer.core.instrument.Counter;
@@ -36,16 +42,23 @@ import io.micrometer.core.instrument.MeterRegistry;
  * with the data, so a snapshot restored while every app was down carries the
  * old server's id and is caught by the first check.
  *
- * <p>Until a process's latest check has passed it refuses reservations and
- * rebuilds ({@link #verified}), so it never trusts state before checking it, nor
- * while another instance is still wiping. What stays open: a running instance
- * keeps its last verdict until its next check, so for up to about a second after
- * its Redis is replaced by one with older data it still sells on that state.
+ * <p>A process refuses reservations and rebuilds ({@link #verified}) unless a
+ * check that passed started within {@code redis-check-max-age} (default: two
+ * check intervals, 2 s), measured on a monotonic clock. So it never trusts state
+ * before checking it, nor while another instance is still wiping, nor once its
+ * own checks have stopped coming: a check stuck on Redis, a paused process, a
+ * starved thread. The checks run on a thread of their own, every
+ * {@code redis-check-interval} (1 s), so other jobs can't delay them.
+ *
+ * <p>What stays open: a running instance trusts its last passing check for up to
+ * the max age, so for that long after its Redis is replaced by one with older
+ * data it may still sell on that state. That is a configured bound on how stale a
+ * verdict may be, not a hard real-time guarantee on when the next check runs.
  * Compose runs Redis without persistence, so a restart there comes back empty
  * and is refused at once.
  */
 @Component
-public class RedisRestartGuard {
+public class RedisRestartGuard implements DisposableBean {
 
 	private static final Logger log = LoggerFactory.getLogger(RedisRestartGuard.class);
 
@@ -61,60 +74,104 @@ public class RedisRestartGuard {
 
 	private final Counter detected;
 
+	private final Duration interval;
+
+	private final long maxAgeNanos;
+
+	/** Monotonic nanoseconds (System::nanoTime); a test can drive it. */
+	private final LongSupplier nanoTime;
+
 	/**
 	 * Default deny: false until the first check, and whenever the last one found a
-	 * changed server. Reservations and rebuilds wait for it, so a process that just
-	 * started on top of a restored snapshot, or that runs while another instance is
-	 * (re)doing a wipe, can't sell on, or rebuild into, state that isn't trusted.
-	 * It gates this process only; the wipe itself is decided once, in Redis.
+	 * changed server or failed. Reservations and rebuilds wait for it, so a process
+	 * that just started on top of a restored snapshot, or that runs while another
+	 * instance is (re)doing a wipe, can't sell on, or rebuild into, state that isn't
+	 * trusted. It gates this process only; the wipe itself is decided once, in Redis.
 	 */
-	private volatile boolean verified;
+	private volatile boolean passed;
 
-	public RedisRestartGuard(StockGateway stock, MeterRegistry meters) {
-		this.stock = stock;
-		this.detected = meters.counter("ticketrush.redis.restarts_detected");
+	/** When the latest check that passed started; only meaningful while {@link #passed}. */
+	private volatile long passedAtNanos;
+
+	private ScheduledExecutorService checks;
+
+	@Autowired
+	public RedisRestartGuard(StockGateway stock, MeterRegistry meters,
+			@Value("${ticketrush.reservations.redis-check-interval:PT1S}") Duration interval,
+			@Value("${ticketrush.reservations.redis-check-max-age:#{null}}") Duration maxAge) {
+		this(stock, meters, interval, maxAge == null ? interval.multipliedBy(2) : maxAge, System::nanoTime);
 	}
 
-	@Scheduled(fixedDelayString = "${ticketrush.reservations.redis-check-interval:PT1S}")
+	/** A guard with the default timing, for tests that drive its checks themselves. */
+	RedisRestartGuard(StockGateway stock, MeterRegistry meters) {
+		this(stock, meters, Duration.ofSeconds(1), Duration.ofSeconds(2), System::nanoTime);
+	}
+
+	RedisRestartGuard(StockGateway stock, MeterRegistry meters, Duration interval, Duration maxAge,
+			LongSupplier nanoTime) {
+		this.stock = stock;
+		this.detected = meters.counter("ticketrush.redis.restarts_detected");
+		this.interval = interval;
+		this.maxAgeNanos = maxAge.toNanos();
+		this.nanoTime = nanoTime;
+	}
+
+	/** Checks once when the app is ready, then every interval on a thread of its own. */
+	@EventListener(ApplicationReadyEvent.class)
+	public void start() {
+		run();
+		checks = Executors.newSingleThreadScheduledExecutor(Thread.ofVirtual().name("redis-restart-guard").factory());
+		checks.scheduleWithFixedDelay(this::run, interval.toMillis(), interval.toMillis(), TimeUnit.MILLISECONDS);
+	}
+
+	@Override
+	public void destroy() {
+		if (checks != null) {
+			checks.shutdownNow();
+		}
+	}
+
 	public void run() {
 		try {
 			check();
 		}
 		catch (RuntimeException ex) {
-			verified = false;
+			passed = false;
 			log.warn("Could not check the Redis server: {}", ex.toString());
 		}
 	}
 
-	/** True only while this process's latest check found the current server trusted. */
+	/** True only while this process's latest check passed and started no longer than the max age ago. */
 	public boolean verified() {
-		return verified;
-	}
-
-	@EventListener(ApplicationReadyEvent.class)
-	public void checkAtStartup() {
-		run();
+		return passed && nanoTime.getAsLong() - passedAtNanos <= maxAgeNanos;
 	}
 
 	public void check() {
+		long started = nanoTime.getAsLong();
 		String server = stock.serverRunId();
 		String owner = UUID.randomUUID().toString();
 		switch (stock.checkServer(server, WIPE_LEASE, owner)) {
-			case TRUSTED -> verified = true;
-			case BUSY -> verified = false; // another instance is wiping
+			case TRUSTED -> pass(started);
+			case BUSY -> passed = false; // another instance is wiping
 			case WIPE -> {
-				verified = false;
+				passed = false;
 				detected.increment();
 				OptionalInt deleted = stock.wipeAllEvents(owner, WIPE_LEASE);
 				if (deleted.isEmpty() || !stock.trustServer(server, owner)) {
 					log.warn("Lost the Redis wipe lock (its lease ran out); the instance that took it over finishes");
 					return;
 				}
-				verified = true;
+				pass(started);
 				log.error("Redis server changed (now {}): its event state may be old, deleted {} keys to rebuild "
 						+ "from MySQL", server, deleted.getAsInt());
 			}
 		}
+	}
+
+	/** The verdict is as old as the moment its check started, not when it finished. */
+	private void pass(long startedNanos) {
+		passedAtNanos = startedNanos;
+		passed = true;
 	}
 
 }
