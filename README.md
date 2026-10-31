@@ -14,23 +14,25 @@ persisted; the cases that fall outside that are spelled out under
 
 ## Results
 
-[`scripts/load_test.py`](scripts/load_test.py) against the Docker Compose stack, driven by [`scripts/consumer_bench.py`](scripts/consumer_bench.py): 20,000 signed-in users (each request carries a JWT the app verifies), 200 in flight at a time, one ticket each. Two scenarios: a **sell-out** (2,000 tickets) and **enough for everyone** (20,000 tickets, so every request becomes an order). Medians of 5 runs per scenario, ranges in brackets. These are the historical A/B runs. Their code snapshot was **reconstructed afterwards** from the saved diff and file timestamps and can't be fully verified (see [`perf/results`](perf/results/README.md)). One later round, with a source snapshot hashed before the build and checked after it, is listed separately there (`perf/results/delivered`: consumer 2,191 messages/s, drain 7.0 s, 202 → visible p99 6.9 s with enough for everyone). It is one sample: it shows that build in the same range as the `batched` runs, and does not re-establish the speed-up. "Delivered" names the code delivered *at that time* (commit `2e4a4ae` plus the working tree recorded in its `env.txt`, before PR #1 was merged), **not the current `main`**: everything since (the claim script, the Redis restart guard and its fenced wipe, the sale cutoff, after-sale processing) has not been benchmarked. What CI checks on every push is correctness under load, not speed.
+[`scripts/load_test.py`](scripts/load_test.py) against the Docker Compose stack, driven by [`scripts/consumer_bench.py`](scripts/consumer_bench.py): 20,000 signed-in users (each request carries a JWT the app verifies), 200 in flight at a time, one ticket each. Two scenarios: a **sell-out** (2,000 tickets, so 90% of the answers are `SOLD_OUT`) and **enough for everyone** (20,000 tickets, so every request becomes an order). Medians of 5 runs per scenario, ranges in brackets, measured on 2026-10-31 on commit `9e410b5` with no uncommitted changes: the source was hashed before the build and still matched after the runs ([`perf/results/main-9e410b5`](perf/results/main-9e410b5), machine and Docker in its `env.txt`). One laptop (Apple M5, Docker Desktop with 10 CPUs and 8 GB), load generator on the same machine. What CI checks on every push is correctness under load, not speed.
 
 | | Sell-out: 2,000 tickets | Enough for everyone: 20,000 tickets |
 |---|---|---|
-| HTTP requests/s (all answers) | **9,500** [6,600 – 10,000] | **8,200** [6,700 – 8,700] |
-| Latency of 202 answers | p50 20 ms · p95 45 ms · p99 60 ms | p50 22 ms · p95 41 ms · p99 57 ms |
-| Consumer, messages written per second while backlogged | 830 | **2,300** [1,930 – 2,370] |
-| Kafka backlog peak (consumer lag) | ~1,900 | ~18,800 |
-| Backlog drained after the last response | 0.45 s | 6.5 s |
-| 202 → `GET /orders/{id}` shows the order (sampled) | p50 2.0 s · p95 2.2 s · p99 2.2 s | p50 4.2 s · p95 6.3 s · p99 6.4 s |
+| HTTP requests/s (all answers) | **9,470** [6,014 – 9,927] | **8,535** [8,265 – 9,010] |
+| Reservations accepted (202) per second | 947 (the other answers are `SOLD_OUT`) | **8,535**: every request |
+| Latency of 202 answers | p50 19 ms · p95 50 ms · p99 64 ms | p50 21 ms · p95 38 ms · p99 **52 ms** |
+| Orders in MySQL per second, first request to last order stored | 811 | **2,202** [2,170 – 2,239] |
+| Consumer, messages written per second while backlogged | 808 | 2,253 [2,200 – 2,303] |
+| Kafka backlog peak (consumer lag) | ~1,750 | ~19,200 |
+| Backlog drained after the last response | 0.40 s | 6.7 s |
+| 202 → `GET /orders/{id}` shows the order (sampled) | p50 2.0 s · p95 2.2 s · p99 2.2 s | p50 4.4 s · p95 6.5 s · p99 6.7 s |
 | Correctness, every run | exactly 2,000 sold, 2,000 persisted, stores agree | 20,000 sold and persisted, stores agree |
 
-In these runs the HTTP side answered ~8–9k requests/s, with 202 answers at p99 ≤ 60 ms. The order writer was the slower half: all orders for one event share one Kafka partition and one consumer thread. When nearly every request succeeded, the backlog was the whole burst, and an order showed `PROCESSING` for up to ~6 s.
+The first sell-out run was the slow one (6,014 requests/s, 202 p99 90 ms); the other four were 8,873 – 9,927. These numbers are in the same range as the historical `batched` runs below (`python3 perf/compare.py batched main-9e410b5`), so the reliability work since then (the claim script, the Redis restart guard and its fenced wipe, the sale cutoff, timeouts) shows no measurable cost here; five runs per side can't rule out a small one. In these runs the HTTP side answered ~8.5–9.5k requests/s, with 202 answers at p99 ≤ 64 ms. The order writer was the slower half: all orders for one event share one Kafka partition and one consumer thread. When nearly every request succeeded, the backlog was the whole burst, and an order showed `PROCESSING` for up to ~6 s.
 
 ### Consumer batching, before and after
 
-The consumer used to write each message in its own transaction. Measured on the version with all the reliability work (same script, machine and scenarios, the two sides run one after the other on fresh stacks; raw results in [`perf/results/`](perf/results/), compared with [`perf/compare.py`](perf/compare.py)):
+The consumer used to write each message in its own transaction. Measured on the version with all the reliability work (same script, machine and scenarios, the two sides run one after the other on fresh stacks; raw results in [`perf/results/`](perf/results/), compared with [`perf/compare.py`](perf/compare.py)). These are historical runs: their code snapshot was **reconstructed afterwards** from the saved diff and file timestamps and can't be fully verified (see [`perf/results`](perf/results/README.md)):
 
 | Enough for everyone, medians of 5 [range] | One transaction per message | One transaction per poll (≤ 200) |
 |---|---|---|
