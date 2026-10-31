@@ -252,7 +252,7 @@ class RecoveryIntegrationTest extends AbstractIntegrationTest {
 	private SeedOrder seedOf(String orderId, String user, boolean active) {
 		var order = orders.findById(orderId).orElseThrow();
 		String message = active ? json.writeValueAsString(OrderRequested.of(order)) : null;
-		return new SeedOrder(orderId, user, order.getIdempotencyKey(), message, Duration.ofHours(1));
+		return new SeedOrder(orderId, user, order.getIdempotencyKey(), order.getQuantity(), message, Duration.ofHours(1));
 	}
 
 }

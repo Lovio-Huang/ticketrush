@@ -171,7 +171,7 @@ public class StockRecovery {
 
 	private SeedOrder seedOf(Order order, Instant now) {
 		String orderJson = order.getStatus().holdsTickets() ? json.writeValueAsString(OrderRequested.of(order)) : null;
-		return new SeedOrder(order.getId(), order.getUserId(), order.getIdempotencyKey(), orderJson,
+		return new SeedOrder(order.getId(), order.getUserId(), order.getIdempotencyKey(), order.getQuantity(), orderJson,
 				Duration.between(now, order.getCreatedAt().plus(idempotencyTtl)));
 	}
 

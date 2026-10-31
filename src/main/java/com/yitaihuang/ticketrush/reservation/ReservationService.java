@@ -12,6 +12,8 @@ import org.springframework.stereotype.Service;
 import com.yitaihuang.ticketrush.common.ApiException;
 import com.yitaihuang.ticketrush.event.EventCatalog;
 import com.yitaihuang.ticketrush.event.EventSnapshot;
+import com.yitaihuang.ticketrush.order.Order;
+import com.yitaihuang.ticketrush.order.OrderRepository;
 import com.yitaihuang.ticketrush.order.OrderRequested;
 import com.yitaihuang.ticketrush.order.PendingOrderTracker;
 import com.yitaihuang.ticketrush.reservation.StockGateway.Reservation;
@@ -47,10 +49,13 @@ public class ReservationService {
 
 	private final Clock clock;
 
+	private final OrderRepository orders;
+
 	public ReservationService(EventCatalog catalog, StockGateway stock, StockRecovery recovery,
 			RateLimiter rateLimiter, OrderRequestPublisher publisher, PendingOrderTracker pendingOrders,
-			JsonMapper json, MeterRegistry meters, Clock clock) {
+			OrderRepository orders, JsonMapper json, MeterRegistry meters, Clock clock) {
 		this.catalog = catalog;
+		this.orders = orders;
 		this.stock = stock;
 		this.recovery = recovery;
 		this.rateLimiter = rateLimiter;
@@ -82,14 +87,11 @@ public class ReservationService {
 					ApiException.conflict("SALE_NOT_STARTED", "Ticket sales open at " + event.saleStartsAt()));
 		}
 
-		if (!now.isBefore(event.startsAt())) {
-			// The sale ends when the event starts. A retry of a request accepted before still gets its order.
-			Optional<String> accepted = stock.acceptedOrderId(eventId, userId, idempotencyKey);
-			if (accepted.isPresent()) {
-				return duplicate(accepted.get(), userId);
-			}
-			throw saleEnded();
-		}
+		// The sale ends when the event starts. After that the script still runs, with an end in the past, so a
+		// retry of a request accepted before is matched against its key exactly as during the sale (same
+		// order, or a conflict), and anything else is refused.
+		boolean closed = !now.isBefore(event.startsAt());
+		Instant saleEndsAt = closed ? Instant.EPOCH : event.startsAt();
 
 		int amountCents;
 		try {
@@ -107,15 +109,24 @@ public class ReservationService {
 		String orderJson = json.writeValueAsString(new OrderRequested(orderId, eventId, userId, quantity,
 				amountCents, idempotencyKey, now));
 		Reservation reservation = stock.reserve(eventId, userId, quantity, event.perUserLimit(), idempotencyKey,
-				orderId, orderJson, event.startsAt());
+				orderId, orderJson, saleEndsAt);
 		if (reservation.outcome() == StockGateway.Outcome.NOT_INITIALIZED && recovery.rebuild(eventId)) {
 			reservation = stock.reserve(eventId, userId, quantity, event.perUserLimit(), idempotencyKey, orderId,
-					orderJson, event.startsAt());
+					orderJson, saleEndsAt);
 		}
 
 		return switch (reservation.outcome()) {
 			case RESERVED -> handOff(eventId, userId, idempotencyKey, orderId, orderJson);
 			case DUPLICATE -> duplicate(reservation.orderId(), userId);
+			case IDEMPOTENCY_CONFLICT -> throw idempotencyConflict();
+			case DUPLICATE_UNVERIFIED -> {
+				// A key from before quantities were recorded, its order no longer in Redis: the stored order decides.
+				Optional<Order> stored = orders.findById(reservation.orderId());
+				if (stored.isEmpty() || !stored.get().isSameRequestAs(eventId, userId, quantity)) {
+					throw idempotencyConflict();
+				}
+				yield duplicate(reservation.orderId(), userId);
+			}
 			case SOLD_OUT -> throw rejected("sold_out", ApiException.conflict("SOLD_OUT", "No tickets left"));
 			case LIMIT_EXCEEDED -> throw rejected("limit_exceeded", ApiException.conflict("PURCHASE_LIMIT_EXCEEDED",
 					"At most " + event.perUserLimit() + " tickets per customer"));
@@ -133,6 +144,11 @@ public class ReservationService {
 		pendingOrders.markProcessing(orderId, userId);
 		count("duplicate");
 		return new Result(orderId, true);
+	}
+
+	private ApiException idempotencyConflict() {
+		return rejected("idempotency_conflict", ApiException.unprocessable("IDEMPOTENCY_CONFLICT",
+				"This Idempotency-Key was already used for a different request; use a new key for a new request"));
 	}
 
 	private ApiException saleEnded() {

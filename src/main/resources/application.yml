@@ -30,6 +30,12 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+      # Without these, a Redis that stops answering holds a request (or a consumer
+      # thread) for Lettuce's default 60 s. A timeout doesn't undo a command that
+      # was already sent: callers retry idempotently (the same Idempotency-Key, the
+      # consumer's redelivery), never assume it didn't run.
+      timeout: ${REDIS_COMMAND_TIMEOUT:2s}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT:2s}
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:

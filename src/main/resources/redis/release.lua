@@ -32,7 +32,9 @@ local held = redis.call('HGET', KEYS[3], ARGV[1])
 redis.call('HSET', KEYS[3], ARGV[1], 'R')
 redis.call('ZREM', KEYS[4], ARGV[1])
 redis.call('SREM', KEYS[5], ARGV[1])
-if KEYS[7] and redis.call('GET', KEYS[7]) == ARGV[1] then
+local key = KEYS[7] and redis.call('GET', KEYS[7])
+-- '<orderId>|<quantity>', or the order id alone if written before quantities were recorded
+if key and (key == ARGV[1] or string.sub(key, 1, #ARGV[1] + 1) == ARGV[1] .. '|') then
     redis.call('DEL', KEYS[7])
 end
 

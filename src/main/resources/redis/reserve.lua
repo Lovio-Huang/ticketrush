@@ -7,7 +7,7 @@
 --
 -- KEYS[1] stock counter      ticketrush:{event:<id>}:stock
 -- KEYS[2] buyers hash        ticketrush:{event:<id>}:buyers   (userId -> tickets held)
--- KEYS[3] idempotency key    ticketrush:{event:<id>}:idem:<userId>:<key>
+-- KEYS[3] idempotency key    ticketrush:{event:<id>}:idem:<userId>:<key>   ('<orderId>|<quantity>')
 -- KEYS[4] orders hash        ticketrush:{event:<id>}:orders   (orderId -> order JSON while held, 'R' once released)
 -- KEYS[5] outbox             ticketrush:{event:<id>}:outbox   (orderId scored by accept time, until Kafka confirms)
 -- KEYS[6] held counter       ticketrush:{event:<id>}:held     (tickets of held orders; stock + held = total)
@@ -22,9 +22,32 @@
 --
 -- Returns {outcome, orderId}
 
+-- The key belongs to one request: this user, this event (both in the key's name)
+-- and this quantity. The same key with another quantity is a conflict, never the
+-- original order and never a second reservation. A key written before quantities
+-- were recorded holds the order id alone: then the held order says what it was
+-- for, and if Redis no longer has it, the caller checks the order in MySQL.
 local existing = redis.call('GET', KEYS[3])
 if existing then
-    return {'DUPLICATE', existing}
+    local sep = string.find(existing, '|', 1, true)
+    local id, qty
+    if sep then
+        id = string.sub(existing, 1, sep - 1)
+        qty = tonumber(string.sub(existing, sep + 1))
+    else
+        id = existing
+        local held = redis.call('HGET', KEYS[4], id)
+        if held and held ~= 'R' then
+            qty = tonumber(cjson.decode(held).quantity)
+        end
+    end
+    if not qty then
+        return {'DUPLICATE_UNVERIFIED', id}
+    end
+    if qty ~= tonumber(ARGV[2]) then
+        return {'IDEMPOTENCY_CONFLICT', id}
+    end
+    return {'DUPLICATE', id}
 end
 
 local t = redis.call('TIME')
@@ -59,7 +82,7 @@ end
 redis.call('DECRBY', KEYS[1], qty)
 redis.call('INCRBY', KEYS[6], qty)
 redis.call('HINCRBY', KEYS[2], ARGV[1], qty)
-redis.call('SET', KEYS[3], ARGV[4], 'EX', tonumber(ARGV[5]))
+redis.call('SET', KEYS[3], ARGV[4] .. '|' .. ARGV[2], 'EX', tonumber(ARGV[5]))
 redis.call('HSET', KEYS[4], ARGV[4], ARGV[6])
 redis.call('ZADD', KEYS[5], now, ARGV[4])
 return {'RESERVED', ARGV[4]}

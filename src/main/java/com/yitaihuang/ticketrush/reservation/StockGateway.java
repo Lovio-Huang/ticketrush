@@ -90,11 +90,20 @@ public class StockGateway {
 
 	public enum Outcome {
 
-		RESERVED, DUPLICATE, SOLD_OUT, LIMIT_EXCEEDED, NOT_INITIALIZED, QUEUE_BACKLOGGED, SALE_ENDED
+		RESERVED, DUPLICATE, SOLD_OUT, LIMIT_EXCEEDED, NOT_INITIALIZED, QUEUE_BACKLOGGED, SALE_ENDED,
+
+		/** The idempotency key was used for another quantity: nothing was reserved. */
+		IDEMPOTENCY_CONFLICT,
+
+		/**
+		 * The key predates recorded quantities and Redis no longer holds its order:
+		 * the caller must compare with the stored order before treating it as a duplicate.
+		 */
+		DUPLICATE_UNVERIFIED
 
 	}
 
-	/** {@code orderId} is the new order on success, or the original order for a duplicate. */
+	/** {@code orderId} is the new order on success, or the original order for a duplicate or conflict. */
 	public record Reservation(Outcome outcome, String orderId) {
 	}
 
@@ -102,7 +111,9 @@ public class StockGateway {
 	 * Reserves the tickets and records {@code orderJson} (the Kafka message) as a
 	 * held order in the outbox, all in one atomic script. A new reservation at or
 	 * after {@code saleEndsAt} by Redis's clock is refused ({@link Outcome#SALE_ENDED});
-	 * a duplicate of one accepted before still returns its order.
+	 * a duplicate of one accepted before still returns its order. The idempotency
+	 * key is compared first, in the same script: same quantity, the original order;
+	 * another quantity, {@link Outcome#IDEMPOTENCY_CONFLICT}.
 	 */
 	@SuppressWarnings("unchecked")
 	public Reservation reserve(long eventId, String userId, int quantity, int perUserLimit, String idempotencyKey,
@@ -114,11 +125,6 @@ public class StockGateway {
 				String.valueOf(idempotencyTtl.toSeconds()), orderJson, String.valueOf(maxUnconfirmedAge.toMillis()),
 				String.valueOf(saleEndsAt.toEpochMilli()));
 		return new Reservation(Outcome.valueOf(result.get(0)), result.get(1));
-	}
-
-	/** The order a request with this idempotency key was accepted as, while Redis still remembers it. */
-	public Optional<String> acceptedOrderId(long eventId, String userId, String idempotencyKey) {
-		return Optional.ofNullable(redis.opsForValue().get(idempotencyKey(eventId, userId, idempotencyKey)));
 	}
 
 	/**
@@ -176,7 +182,7 @@ public class StockGateway {
 	}
 
 	/** One order to put back during a rebuild: its JSON if active, {@code null} if it no longer holds tickets. */
-	public record SeedOrder(String orderId, String userId, String idempotencyKey, String orderJson,
+	public record SeedOrder(String orderId, String userId, String idempotencyKey, int quantity, String orderJson,
 			Duration idempotencyLeft) {
 	}
 
@@ -213,7 +219,7 @@ public class StockGateway {
 	/** Seeds one batch under this caller's lease; false if the lease is no longer theirs. */
 	public boolean seed(long eventId, String token, Duration lease, List<SeedOrder> batch) {
 		List<String> keys = new ArrayList<>(batch.size() + 2);
-		List<String> args = new ArrayList<>(batch.size() * 3 + 2);
+		List<String> args = new ArrayList<>(batch.size() * 4 + 2);
 		keys.add(rebuildKey(eventId));
 		keys.add(ordersKey(eventId));
 		args.add(token);
@@ -223,6 +229,7 @@ public class StockGateway {
 			args.add(order.orderId());
 			args.add(order.orderJson() == null ? RELEASED : order.orderJson());
 			args.add(String.valueOf(Math.max(0, order.idempotencyLeft().toSeconds())));
+			args.add(String.valueOf(order.quantity()));
 		}
 		Long seeded = redis.execute(SEED, keys, args.toArray());
 		return seeded != null && seeded >= 0;

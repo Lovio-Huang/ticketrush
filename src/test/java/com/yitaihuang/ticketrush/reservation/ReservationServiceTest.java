@@ -26,6 +26,8 @@ import org.springframework.http.HttpStatus;
 import com.yitaihuang.ticketrush.common.ApiException;
 import com.yitaihuang.ticketrush.event.EventCatalog;
 import com.yitaihuang.ticketrush.event.EventSnapshot;
+import com.yitaihuang.ticketrush.order.Order;
+import com.yitaihuang.ticketrush.order.OrderRepository;
 import com.yitaihuang.ticketrush.order.OrderRequested;
 import com.yitaihuang.ticketrush.order.PendingOrderTracker;
 import com.yitaihuang.ticketrush.reservation.OrderRequestPublisher.Delivery;
@@ -54,13 +56,15 @@ class ReservationServiceTest {
 
 	private final PendingOrderTracker pendingOrders = mock();
 
+	private final OrderRepository orders = mock();
+
 	private final SimpleMeterRegistry meters = new SimpleMeterRegistry();
 
 	private ReservationService service;
 
 	@BeforeEach
 	void setUp() {
-		service = new ReservationService(catalog, stock, recovery, rateLimiter, publisher, pendingOrders,
+		service = new ReservationService(catalog, stock, recovery, rateLimiter, publisher, pendingOrders, orders,
 				new JsonMapper(), meters, Clock.fixed(NOW, ZoneOffset.UTC));
 		when(publisher.publish(anyLong(), anyString(), anyString())).thenReturn(Delivery.ACKED);
 		when(rateLimiter.tryAcquire(anyString())).thenReturn(true);
@@ -128,14 +132,16 @@ class ReservationServiceTest {
 		// startsAt == now: closed. One millisecond before: still open (acceptedReservationIsPublished...).
 		EventSnapshot starting = new EventSnapshot(4L, "Now", "Arena", NOW, NOW.minusSeconds(3_600), 100, 2_500, 4);
 		when(catalog.get(4L)).thenReturn(starting);
+		givenRedisAnswers(Outcome.SALE_ENDED);
 
 		assertThatThrownBy(() -> service.reserve(4L, "alice", 1, "key-1")).isInstanceOfSatisfying(ApiException.class,
 				ex -> {
 					assertThat(ex.getStatus()).isEqualTo(HttpStatus.CONFLICT);
 					assertThat(ex.getCode()).isEqualTo("SALE_ENDED");
 				});
-		verify(stock, never()).reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(),
-				anyString(), any());
+		// The app's clock decided the sale is over: Redis only looks the key up, with an end in the past.
+		verify(stock).reserve(eq(4L), anyString(), anyInt(), anyInt(), anyString(), anyString(), anyString(),
+				eq(Instant.EPOCH));
 		verifyNoInteractions(publisher);
 	}
 
@@ -154,20 +160,50 @@ class ReservationServiceTest {
 		EventSnapshot started = new EventSnapshot(6L, "Started", "Arena", NOW.minusSeconds(60), NOW.minusSeconds(3_600),
 				100, 2_500, 4);
 		when(catalog.get(6L)).thenReturn(started);
-		when(stock.acceptedOrderId(6L, "alice", "key-1")).thenReturn(Optional.of("order-1"));
+		givenRedisAnswers(Outcome.SALE_ENDED);
+		when(stock.reserve(eq(6L), eq("alice"), eq(1), anyInt(), eq("key-1"), anyString(), anyString(),
+				eq(Instant.EPOCH)))
+			.thenReturn(new Reservation(Outcome.DUPLICATE, "order-1"));
 
 		ReservationService.Result retry = service.reserve(6L, "alice", 1, "key-1");
 
 		assertThat(retry.orderId()).isEqualTo("order-1");
 		assertThat(retry.replayed()).isTrue();
-		verify(stock, never()).reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(),
-				anyString(), any());
 		verifyNoInteractions(publisher);
 		// A different key (or another user) is a new request: refused.
 		assertThatThrownBy(() -> service.reserve(6L, "alice", 1, "key-2"))
 			.hasFieldOrPropertyWithValue("code", "SALE_ENDED");
 		assertThatThrownBy(() -> service.reserve(6L, "bob", 1, "key-1"))
 			.hasFieldOrPropertyWithValue("code", "SALE_ENDED");
+	}
+
+	@Test
+	void aKeyUsedForAnotherQuantityIsAConflictAndNothingIsSent() {
+		givenRedisAnswers(Outcome.IDEMPOTENCY_CONFLICT);
+
+		assertThatThrownBy(() -> service.reserve(1L, "alice", 2, "key-1")).isInstanceOfSatisfying(ApiException.class,
+				ex -> {
+					assertThat(ex.getStatus()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+					assertThat(ex.getCode()).isEqualTo("IDEMPOTENCY_CONFLICT");
+				});
+		verifyNoInteractions(publisher, pendingOrders);
+	}
+
+	@Test
+	void aKeyRedisCantVerifyIsCheckedAgainstTheStoredOrder() {
+		when(stock.reserve(anyLong(), anyString(), anyInt(), anyInt(), anyString(), anyString(), anyString(), any()))
+			.thenReturn(new Reservation(Outcome.DUPLICATE_UNVERIFIED, "order-1"));
+		Order stored = mock();
+		when(stored.isSameRequestAs(1L, "alice", 2)).thenReturn(true);
+		when(orders.findById("order-1")).thenReturn(Optional.of(stored));
+
+		assertThat(service.reserve(1L, "alice", 2, "key-1")).isEqualTo(new ReservationService.Result("order-1", true));
+		assertThatThrownBy(() -> service.reserve(1L, "alice", 3, "key-1"))
+			.hasFieldOrPropertyWithValue("code", "IDEMPOTENCY_CONFLICT");
+		when(orders.findById("order-1")).thenReturn(Optional.empty()); // nothing left to compare with: refused
+		assertThatThrownBy(() -> service.reserve(1L, "alice", 2, "key-1"))
+			.hasFieldOrPropertyWithValue("code", "IDEMPOTENCY_CONFLICT");
+		verifyNoInteractions(publisher);
 	}
 
 	@Test

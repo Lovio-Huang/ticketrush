@@ -190,8 +190,8 @@ class PublishReleaseRaceIntegrationTest extends AbstractIntegrationTest {
 	}
 
 	private ReservationService serviceWith(OrderRequestPublisher publisher) {
-		return new ReservationService(catalog, stock, recovery, rateLimiter, publisher, pendingOrders, json, meters,
-				Clock.systemUTC());
+		return new ReservationService(catalog, stock, recovery, rateLimiter, publisher, pendingOrders, orders, json,
+				meters, Clock.systemUTC());
 	}
 
 	private static void awaitLatch(CountDownLatch latch) {
