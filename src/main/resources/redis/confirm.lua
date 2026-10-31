@@ -44,7 +44,7 @@ end
 
 redis.call('HSET', KEYS[3], ARGV[1], ARGV[2])
 if tonumber(ARGV[3]) > 0 then
-    redis.call('SET', KEYS[7], ARGV[1], 'NX', 'EX', tonumber(ARGV[3]))
+    redis.call('SET', KEYS[7], ARGV[1] .. '|' .. cjson.decode(ARGV[2]).quantity, 'NX', 'EX', tonumber(ARGV[3]))
 end
 -- No stock key means a rebuild is running; its final recount counts this order.
 if redis.call('EXISTS', KEYS[1]) == 1 then

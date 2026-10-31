@@ -148,7 +148,7 @@ public abstract class AbstractIntegrationTest {
 	 * The invariants, checked together: Redis stock and per-user counts equal what
 	 * the held orders imply, MySQL stock equals what its active orders imply, Redis
 	 * holds exactly MySQL's active orders, the outbox is empty, and every stored
-	 * order's idempotency key still points at it.
+	 * order's idempotency key still points at it (with its quantity).
 	 */
 	protected void assertStoresAgree(long eventId) {
 		String prefix = "ticketrush:{event:" + eventId + "}:";
@@ -186,8 +186,8 @@ public abstract class AbstractIntegrationTest {
 		// A rejected order never held tickets for the client; its key may have been forgotten for a retry.
 		for (Order order : stored.stream().filter(o -> o.getStatus() != OrderStatus.REJECTED).toList()) {
 			assertThat(redis.opsForValue().get(prefix + "idem:" + order.getUserId() + ":" + order.getIdempotencyKey()))
-				.as("idempotency key of %s", order.getId())
-				.isEqualTo(order.getId());
+				.as("idempotency key of %s: the order and the quantity it was for", order.getId())
+				.isEqualTo(order.getId() + "|" + order.getQuantity());
 		}
 	}
 

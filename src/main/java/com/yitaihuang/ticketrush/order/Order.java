@@ -96,6 +96,11 @@ public class Order {
 		return this.userId.equals(userId);
 	}
 
+	/** Whether this order is what an idempotent retry with this user, event and quantity asked for. */
+	public boolean isSameRequestAs(long eventId, String userId, int quantity) {
+		return this.eventId == eventId && this.userId.equals(userId) && this.quantity == quantity;
+	}
+
 	/** Whether {@code request} is the message this order was created from (a redelivery, not a conflict). */
 	boolean isSameRequest(OrderRequested request) {
 		return id.equals(request.orderId()) && eventId == request.eventId() && userId.equals(request.userId())
