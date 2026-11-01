@@ -1,0 +1,15 @@
+Event 2: 2000 tickets, 20000 users, concurrency 200
+
+HTTP burst    20000 requests in 3.33s  ->  6,014 req/s  (601 accepted/s)
+Latency (ms)  202 only:  p50 42.1   p95 72.9   p99 90.3   max 121.1
+              rejected:  p50 30.0   p95 47.9   p99 54.5   max 78.8
+Outcomes      SOLD_OUT=18000, accepted=2000
+
+Pipeline      2000/2000 orders in MySQL 4.39s after the start  ->  455 orders/s end to end; drained 1.07s after the last response
+202->visible  (ms, 200 sampled)  p50 3590.6   p95 3842.9   p99 3857.5   max 3872.1
+Kafka backlog peak 1,962 messages; lag back to 0 1.16s after the last response; consumer wrote 467 msgs/s while backlogged
+
+Left on sale  MySQL 0, Redis 0, in sync: True
+{"tickets": 2000, "users": 20000, "concurrency": 200, "req_per_s": 6014, "accepted_per_s": 601, "orders_per_s_end_to_end": 455, "drain_s": 1.07, "peak_lag": 1962.0, "lag_zero_s": 1.16, "consumer_per_s": 467, "ok_p50": 42.05191700020805, "ok_p95": 72.91883300058544, "ok_p99": 90.31724999658763, "visible_p50": 3590.574229005142, "visible_p95": 3842.8688749991124, "visible_p99": 3857.4855420010863, "outcomes": {"accepted": 2000, "SOLD_OUT": 18000}, "pass": true}
+
+PASS: sold exactly 2000 tickets, every order persisted, stores agree

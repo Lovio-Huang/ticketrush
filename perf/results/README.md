@@ -24,6 +24,7 @@ processing, dead-lettered order status) were not benchmarked.
 | Label | Driver | Code | Runs |
 |---|---|---|---|
 | `delivered` | `scripts/consumer_bench.py` | `source.tar.gz`: every file under `src`, `scripts`, `pom.xml`, `compose.yaml`, `Dockerfile`, archived and hashed (`source.sha256`) before the build; `source-check.txt` confirms the hashes still matched after the run | 1 round per scenario: a check that the delivered build behaves like the `batched` runs, not a new measurement of the speed-up |
+| `main-9e410b5` | `scripts/consumer_bench.py` | commit `9e410b5` (`main` on 2026-10-31), no uncommitted changes (`code.diff` is empty), snapshot hashed and checked the same way | 5 rounds per scenario, the numbers in the main README. Run under the label `current-main` (as `env.txt` lists it) and renamed after the run; no file was changed |
 
 `baseline` and `batched`: same laptop (`env.txt`), fresh compose stack each
 (project `trbench`, ports 18080/13306/16379/19092), one warm-up of 2,000
